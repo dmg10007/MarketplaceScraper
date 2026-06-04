@@ -1,0 +1,42 @@
+# Environment — NEVER commit secrets
+.env
+
+# Runtime data
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Browser session — contains live auth cookies
+data/fb_session.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
