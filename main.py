@@ -54,18 +54,35 @@ def check_session_exists() -> None:
 
 
 def free_port(port: int) -> None:
-    """Kill any processes currently listening on the given port."""
+    """Kill any PIDs currently listening on the given port.
+
+    Uses psutil.net_connections() directly — compatible with psutil 5 and 6+.
+    (psutil 6 removed 'connections' from process_iter attrs.)
+    """
     killed: list[int] = []
-    for proc in psutil.process_iter(["pid", "connections"]):
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except psutil.AccessDenied:
+        # On Windows, net_connections() may need elevation; fall back silently.
+        log.warning("Cannot check port %d — run as Administrator to auto-free ports.", port)
+        return
+
+    pids_on_port = {
+        c.pid
+        for c in conns
+        if c.laddr.port == port
+        and c.status == psutil.CONN_LISTEN
+        and c.pid is not None
+        and c.pid != psutil.Process().pid
+    }
+
+    for pid in pids_on_port:
         try:
-            for conn in proc.connections(kind="inet"):
-                if conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
-                    if proc.pid == psutil.Process().pid:
-                        continue  # Don’t kill ourselves
-                    proc.kill()
-                    killed.append(proc.pid)
+            psutil.Process(pid).kill()
+            killed.append(pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+
     if killed:
         log.info("Freed port %d by killing PID(s): %s", port, killed)
 
