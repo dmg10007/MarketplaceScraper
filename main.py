@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import psutil
 import uvicorn
 from fastapi import FastAPI
 from rich.logging import RichHandler
@@ -33,7 +34,7 @@ log = logging.getLogger("main")
 
 
 # ---------------------------------------------------------------------------
-# Pre-flight check — require a saved session before starting
+# Pre-flight checks
 # ---------------------------------------------------------------------------
 
 def check_session_exists() -> None:
@@ -42,17 +43,31 @@ def check_session_exists() -> None:
         console.print()
         console.print("[bold red]  No saved Facebook session found.[/bold red]")
         console.print()
-        console.print("  Before running main.py, you need to log in once manually so")
-        console.print("  the bot can save your session cookies.")
-        console.print()
         console.print("  Run the setup script first:")
         console.print()
         console.print("  [bold cyan]  python scripts/setup_session.py[/bold cyan]")
         console.print()
-        console.print("  A browser window will open. Log in to Facebook (solve any")
-        console.print("  CAPTCHA), then the script will save your session automatically.")
+        console.print("  A browser window will open — log in to Facebook (solve any")
+        console.print("  CAPTCHA), then the script saves your session automatically.")
         console.print()
         sys.exit(1)
+
+
+def free_port(port: int) -> None:
+    """Kill any processes currently listening on the given port."""
+    killed: list[int] = []
+    for proc in psutil.process_iter(["pid", "connections"]):
+        try:
+            for conn in proc.connections(kind="inet"):
+                if conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+                    if proc.pid == psutil.Process().pid:
+                        continue  # Don’t kill ourselves
+                    proc.kill()
+                    killed.append(proc.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if killed:
+        log.info("Freed port %d by killing PID(s): %s", port, killed)
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +104,7 @@ async def health():
 
 if __name__ == "__main__":
     check_session_exists()
+    free_port(settings.dashboard_port)
     uvicorn.run(
         "main:app",
         host=settings.dashboard_host,
