@@ -66,7 +66,6 @@ async def _apply_stealth(page: Page) -> None:
 # Dialog dismissal helpers
 # ---------------------------------------------------------------------------
 
-# Overlays that can appear BEFORE the login form (cookie/consent banners)
 _PRE_LOGIN_DIALOGS = [
     "[data-testid='cookie-policy-manage-dialog-accept-button']",
     "button[title='Accept all']",
@@ -76,17 +75,11 @@ _PRE_LOGIN_DIALOGS = [
     "div[role='dialog'] button:has-text('OK')",
 ]
 
-# Overlays that can appear AFTER a successful login
-# ("Remember Password", "Turn on notifications", etc.)
 _POST_LOGIN_DIALOGS = [
-    # "Remember Password" modal — click "Not Now"
     "div[role='dialog'] div[aria-label='Not Now']",
     "div[role='dialog'] button:has-text('Not Now')",
     "div[role='dialog'] button:has-text('Not now')",
-    # "Turn on notifications" prompt
-    "div[role='dialog'] button:has-text('Not Now')",
     "div[role='dialog'] button:has-text('Close')",
-    # Generic dismiss via X button inside a dialog
     "div[role='dialog'] div[aria-label='Close']",
     "div[role='dialog'] [aria-label='Close']",
 ]
@@ -101,7 +94,6 @@ async def _dismiss_dialogs(page: Page, selectors: list[str], label: str) -> None
                 log.info("Dismissing %s dialog: %s", label, sel)
                 await btn.click()
                 await asyncio.sleep(1.0)
-                # Check for a second stacked dialog
                 for sel2 in selectors:
                     try:
                         btn2 = await page.wait_for_selector(sel2, timeout=2_000, state="visible")
@@ -123,9 +115,6 @@ class SessionManager:
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
-        # Set to True immediately after a successful login so that
-        # get_page() does not immediately re-check session expiry
-        # before any navigation has happened.
         self._just_logged_in: bool = False
 
     # ------------------------------------------------------------------
@@ -133,7 +122,6 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Launch browser and restore or create a Facebook session."""
         self._playwright = await async_playwright().start()
 
         launch_kwargs: dict = dict(
@@ -152,14 +140,23 @@ class SessionManager:
         log.info("SessionManager started.")
 
     async def stop(self) -> None:
-        """Gracefully shut down — save session before closing."""
+        """Gracefully shut down — best-effort session save before closing."""
         await self._save_session()
         if self._context:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:
+                pass
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
         log.info("SessionManager stopped.")
 
     # ------------------------------------------------------------------
@@ -173,8 +170,6 @@ class SessionManager:
             await _apply_stealth(self._page)
             self._just_logged_in = False
 
-        # Skip the expiry check immediately after a fresh login —
-        # the page is on the FB home feed which is a valid logged-in state.
         if not self._just_logged_in and await self._session_expired():
             log.warning("Session expired — re-logging in.")
             await self._login()
@@ -213,7 +208,6 @@ class SessionManager:
             self._context = await self._browser.new_context(**context_kwargs)
             self._page = await self._context.new_page()
             await _apply_stealth(self._page)
-            # Mark as just logged in so the first get_page() call skips expiry check
             self._just_logged_in = True
         else:
             log.info("No saved session found — creating fresh context.")
@@ -223,18 +217,24 @@ class SessionManager:
             await self._login()
 
     async def _save_session(self) -> None:
-        if self._context:
-            SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        """Persist cookies + localStorage. No-op if context is already closed."""
+        if not self._context:
+            return
+        try:
             state = await self._context.storage_state()
+            SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
             SESSION_PATH.write_text(json.dumps(state))
             log.info("Session saved to %s", SESSION_PATH)
+        except Exception as exc:
+            # Browser was already closed (e.g. CTRL+C) — session was saved
+            # at login time so this is safe to skip.
+            log.debug("Session save skipped (context closed): %s", exc)
 
     # ------------------------------------------------------------------
     # Login
     # ------------------------------------------------------------------
 
     async def _login(self) -> None:
-        """Perform Facebook login and persist session on success."""
         log.info("Logging in to Facebook as %s ...", settings.fb_email)
         page = self._page
         if page is None or page.is_closed():
@@ -245,10 +245,8 @@ class SessionManager:
         await page.goto(FB_LOGIN, wait_until="networkidle", timeout=60_000)
         await self._jitter()
 
-        # Dismiss pre-login consent dialogs
         await _dismiss_dialogs(page, _PRE_LOGIN_DIALOGS, "consent")
 
-        # Wait for the email field
         log.info("Waiting for login form...")
         try:
             await page.wait_for_selector("#email", state="visible", timeout=30_000)
@@ -261,7 +259,6 @@ class SessionManager:
                 f"Screenshot saved to {shot_path} — open it to see what Facebook showed."
             )
 
-        # Fill credentials
         await page.fill("#email", settings.fb_email)
         await self._jitter(short=True)
         await page.fill("#pass", settings.fb_password)
@@ -274,7 +271,6 @@ class SessionManager:
             pass
         await self._jitter()
 
-        # Check for hard failure (wrong creds / checkpoint)
         current_url = page.url
         if "login" in current_url or "checkpoint" in current_url:
             shot_path = Path("data/login_debug.png")
@@ -285,7 +281,6 @@ class SessionManager:
                 "Check FB_EMAIL / FB_PASSWORD in .env, or resolve any security checkpoint."
             )
 
-        # Dismiss post-login dialogs ("Remember Password", notifications, etc.)
         log.info("Dismissing post-login dialogs...")
         await _dismiss_dialogs(page, _POST_LOGIN_DIALOGS, "post-login")
 
@@ -294,18 +289,14 @@ class SessionManager:
         log.info("Login successful. Session saved.")
 
     async def _session_expired(self) -> bool:
-        """Return True if the current page indicates the user is logged out."""
         if not self._page or self._page.is_closed():
             return True
         try:
             url = self._page.url
-            # Unnavigated page is not expired
             if not url or url == "about:blank":
                 return False
-            # Only treat /login and /checkpoint as definitive expiry signals
             if "/login" in url or "/checkpoint" in url:
                 return True
-            # Quick DOM check — short timeout to avoid slowing down normal operation
             login_btn = await self._page.query_selector("[name='login']", timeout=2_000)
             return login_btn is not None
         except Exception:
@@ -316,7 +307,6 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def _jitter(self, short: bool = False) -> None:
-        """Random sleep to simulate human pacing."""
         if short:
             await asyncio.sleep(random.uniform(0.3, 1.2))
         else:
@@ -325,5 +315,4 @@ class SessionManager:
             )
 
 
-# Module-level singleton
 session_manager = SessionManager()
