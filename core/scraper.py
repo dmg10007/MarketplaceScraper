@@ -47,9 +47,6 @@ FB_LOGIN = f"{FB_BASE}/login"
 SESSION_PATH = Path(settings.session_file)
 
 _stealth = Stealth() if _STEALTH_V2 else None
-
-# Track which pages have already had stealth applied to suppress the
-# duplicate-application warning emitted by playwright-stealth v2.
 _stealth_applied: set[int] = set()
 
 
@@ -66,30 +63,53 @@ async def _apply_stealth(page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cookie / consent dialog dismissal
+# Dialog dismissal helpers
 # ---------------------------------------------------------------------------
 
-# Selectors for common consent overlays FB shows before the login form.
-_CONSENT_SELECTORS = [
+# Overlays that can appear BEFORE the login form (cookie/consent banners)
+_PRE_LOGIN_DIALOGS = [
     "[data-testid='cookie-policy-manage-dialog-accept-button']",
     "button[title='Accept all']",
     "button[title='Allow all cookies']",
-    # Generic "Allow" or "Accept" buttons inside a dialog
     "div[role='dialog'] button:has-text('Allow')",
     "div[role='dialog'] button:has-text('Accept')",
     "div[role='dialog'] button:has-text('OK')",
 ]
 
+# Overlays that can appear AFTER a successful login
+# ("Remember Password", "Turn on notifications", etc.)
+_POST_LOGIN_DIALOGS = [
+    # "Remember Password" modal — click "Not Now"
+    "div[role='dialog'] div[aria-label='Not Now']",
+    "div[role='dialog'] button:has-text('Not Now')",
+    "div[role='dialog'] button:has-text('Not now')",
+    # "Turn on notifications" prompt
+    "div[role='dialog'] button:has-text('Not Now')",
+    "div[role='dialog'] button:has-text('Close')",
+    # Generic dismiss via X button inside a dialog
+    "div[role='dialog'] div[aria-label='Close']",
+    "div[role='dialog'] [aria-label='Close']",
+]
 
-async def _dismiss_consent(page: Page) -> None:
-    """Click through any cookie / consent dialogs that may block the login form."""
-    for sel in _CONSENT_SELECTORS:
+
+async def _dismiss_dialogs(page: Page, selectors: list[str], label: str) -> None:
+    """Try each selector and click the first one found. Silent if none match."""
+    for sel in selectors:
         try:
             btn = await page.wait_for_selector(sel, timeout=3_000, state="visible")
             if btn:
-                log.info("Dismissing consent dialog: %s", sel)
+                log.info("Dismissing %s dialog: %s", label, sel)
                 await btn.click()
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
+                # Check for a second stacked dialog
+                for sel2 in selectors:
+                    try:
+                        btn2 = await page.wait_for_selector(sel2, timeout=2_000, state="visible")
+                        if btn2:
+                            await btn2.click()
+                            await asyncio.sleep(0.8)
+                    except PWTimeoutError:
+                        continue
                 return
         except PWTimeoutError:
             continue
@@ -103,6 +123,10 @@ class SessionManager:
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        # Set to True immediately after a successful login so that
+        # get_page() does not immediately re-check session expiry
+        # before any navigation has happened.
+        self._just_logged_in: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -147,11 +171,15 @@ class SessionManager:
         if not self._page or self._page.is_closed():
             self._page = await self._context.new_page()
             await _apply_stealth(self._page)
+            self._just_logged_in = False
 
-        if await self._session_expired():
+        # Skip the expiry check immediately after a fresh login —
+        # the page is on the FB home feed which is a valid logged-in state.
+        if not self._just_logged_in and await self._session_expired():
             log.warning("Session expired — re-logging in.")
             await self._login()
 
+        self._just_logged_in = False
         return self._page
 
     async def navigate(self, url: str) -> Page:
@@ -183,9 +211,10 @@ class SessionManager:
             log.info("Restoring session from %s", SESSION_PATH)
             context_kwargs["storage_state"] = json.loads(SESSION_PATH.read_text())
             self._context = await self._browser.new_context(**context_kwargs)
-            # Open a page now so session-expired check works on next get_page()
             self._page = await self._context.new_page()
             await _apply_stealth(self._page)
+            # Mark as just logged in so the first get_page() call skips expiry check
+            self._just_logged_in = True
         else:
             log.info("No saved session found — creating fresh context.")
             self._context = await self._browser.new_context(**context_kwargs)
@@ -213,54 +242,55 @@ class SessionManager:
             await _apply_stealth(page)
             self._page = page
 
-        # Navigate to login page and wait for full load
         await page.goto(FB_LOGIN, wait_until="networkidle", timeout=60_000)
         await self._jitter()
 
-        # Dismiss any cookie / consent overlay that blocks the form
-        await _dismiss_consent(page)
+        # Dismiss pre-login consent dialogs
+        await _dismiss_dialogs(page, _PRE_LOGIN_DIALOGS, "consent")
 
-        # Wait explicitly for the email field — raises a clear error if missing
+        # Wait for the email field
         log.info("Waiting for login form...")
         try:
             await page.wait_for_selector("#email", state="visible", timeout=30_000)
         except PWTimeoutError:
-            # Take a screenshot so we can diagnose what FB actually showed
             shot_path = Path("data/login_debug.png")
             shot_path.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(shot_path))
             raise RuntimeError(
                 f"Login form (#email) not found after 30s. "
-                f"A screenshot was saved to {shot_path} — open it to see what "
-                f"Facebook showed (CAPTCHA, consent dialog, etc.)."
+                f"Screenshot saved to {shot_path} — open it to see what Facebook showed."
             )
 
-        # Fill credentials with human-like pacing
+        # Fill credentials
         await page.fill("#email", settings.fb_email)
         await self._jitter(short=True)
         await page.fill("#pass", settings.fb_password)
         await self._jitter(short=True)
-
         await page.click("[name='login']")
-        # Wait for navigation to settle after clicking Login
+
         try:
             await page.wait_for_load_state("networkidle", timeout=30_000)
         except PWTimeoutError:
-            pass  # networkidle can be slow; continue and check URL
+            pass
         await self._jitter()
 
-        # Verify we actually landed on a logged-in page
+        # Check for hard failure (wrong creds / checkpoint)
         current_url = page.url
         if "login" in current_url or "checkpoint" in current_url:
             shot_path = Path("data/login_debug.png")
             await page.screenshot(path=str(shot_path))
             raise RuntimeError(
-                f"Login did not succeed. Current URL: {current_url}\n"
-                f"Screenshot saved to {shot_path}\n"
-                "Possible causes: wrong credentials, 2FA required, or FB security checkpoint."
+                f"Login did not succeed. URL: {current_url}\n"
+                f"Screenshot: {shot_path}\n"
+                "Check FB_EMAIL / FB_PASSWORD in .env, or resolve any security checkpoint."
             )
 
+        # Dismiss post-login dialogs ("Remember Password", notifications, etc.)
+        log.info("Dismissing post-login dialogs...")
+        await _dismiss_dialogs(page, _POST_LOGIN_DIALOGS, "post-login")
+
         await self._save_session()
+        self._just_logged_in = True
         log.info("Login successful. Session saved.")
 
     async def _session_expired(self) -> bool:
@@ -269,15 +299,17 @@ class SessionManager:
             return True
         try:
             url = self._page.url
-            # New page (about:blank) is not expired — just not navigated yet
-            if url in ("about:blank", ""):
+            # Unnavigated page is not expired
+            if not url or url == "about:blank":
                 return False
-            if "login" in url or "checkpoint" in url:
+            # Only treat /login and /checkpoint as definitive expiry signals
+            if "/login" in url or "/checkpoint" in url:
                 return True
-            login_btn = await self._page.query_selector("[name='login']", timeout=3_000)
+            # Quick DOM check — short timeout to avoid slowing down normal operation
+            login_btn = await self._page.query_selector("[name='login']", timeout=2_000)
             return login_btn is not None
         except Exception:
-            return False  # Assume alive if we can't check
+            return False
 
     # ------------------------------------------------------------------
     # Utility
