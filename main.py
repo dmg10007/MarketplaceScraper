@@ -3,17 +3,21 @@ Entrypoint — starts the Playwright session, then runs the web dashboard.
 The scheduler (Phase 2) will be wired in here.
 """
 
-import asyncio
+import sys
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
 from rich.logging import RichHandler
+from rich.console import Console
 
 from config.settings import settings
 from core.scraper import session_manager
 from db.database import init_db
+
+console = Console()
 
 # ---------------------------------------------------------------------------
 # Logging — rich console output
@@ -26,6 +30,29 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True)],
 )
 log = logging.getLogger("main")
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight check — require a saved session before starting
+# ---------------------------------------------------------------------------
+
+def check_session_exists() -> None:
+    session_path = Path(settings.session_file)
+    if not session_path.exists():
+        console.print()
+        console.print("[bold red]  No saved Facebook session found.[/bold red]")
+        console.print()
+        console.print("  Before running main.py, you need to log in once manually so")
+        console.print("  the bot can save your session cookies.")
+        console.print()
+        console.print("  Run the setup script first:")
+        console.print()
+        console.print("  [bold cyan]  python scripts/setup_session.py[/bold cyan]")
+        console.print()
+        console.print("  A browser window will open. Log in to Facebook (solve any")
+        console.print("  CAPTCHA), then the script will save your session automatically.")
+        console.print()
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +75,7 @@ app = FastAPI(title="MarketplaceScraper", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# Placeholder route — dashboard routes added in Phase 4
+# Routes — dashboard routes added in Phase 4
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
@@ -61,10 +88,11 @@ async def health():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    check_session_exists()
     uvicorn.run(
         "main:app",
         host=settings.dashboard_host,
         port=settings.dashboard_port,
         reload=False,
-        log_config=None,  # Use our Rich logger instead
+        log_config=None,
     )
