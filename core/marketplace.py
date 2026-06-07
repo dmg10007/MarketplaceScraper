@@ -3,8 +3,9 @@ Facebook Marketplace scraper.
 
 URL strategy:
   Uses /marketplace/category/search with location= zip param.
-  Waits for networkidle before querying so React has fully rendered.
-  Saves a screenshot to data/debug_screenshot.png on zero results.
+  Waits for networkidle, then scrolls the RIGHT-SIDE results pane
+  (not window) to trigger lazy-loading of listing cards.
+  Saves a debug screenshot to data/debug_screenshot.png on zero results.
 """
 
 import asyncio
@@ -36,6 +37,40 @@ _ITEM_LINK_RE = re.compile(r"/marketplace/item/(\d+)")
 _CARD_SELECTOR = "a[href*='/marketplace/item/']"
 _SCREENSHOT_PATH = Path("data/debug_screenshot.png")
 _location_warmed: bool = False
+
+# JS that finds the scrollable results pane and scrolls it.
+# FB puts listings in a div with overflow:auto/scroll to the RIGHT of the
+# filter sidebar. We find the first deeply-scrollable div that isn't the
+# sidebar itself (scrollWidth roughly equal to clientWidth, but scrollHeight
+# larger than clientHeight) and scroll it. Falls back to window.scrollBy.
+_SCROLL_JS = """
+(async (scrolls, delay) => {
+    // Find the scrollable results container.
+    // It will be a div with overflow scroll/auto whose scrollHeight > clientHeight.
+    const allDivs = Array.from(document.querySelectorAll('div'));
+    let pane = null;
+    for (const d of allDivs) {
+        const st = window.getComputedStyle(d);
+        const overflow = st.overflowY;
+        if ((overflow === 'auto' || overflow === 'scroll') &&
+            d.scrollHeight > d.clientHeight + 100 &&
+            d.clientHeight > 300) {   // tall enough to be the main results pane
+            pane = d;
+            break;
+        }
+    }
+    const target = pane || window;
+    for (let i = 0; i < scrolls; i++) {
+        if (target === window) {
+            window.scrollBy(0, window.innerHeight * 0.8);
+        } else {
+            target.scrollBy(0, target.clientHeight * 0.8);
+        }
+        await new Promise(r => setTimeout(r, delay + i * 200));
+    }
+    return pane ? 'pane' : 'window';
+})
+"""
 
 
 def _build_url(search: dict) -> str:
@@ -114,7 +149,7 @@ async def _warm_location(page: Page) -> None:
         log.info("Marketplace session warmed.")
     except PWTimeoutError:
         log.warning("Location warmup timed out — proceeding anyway.")
-        _location_warmed = True  # don't retry every search
+        _location_warmed = True
 
 
 async def reset_location_warm() -> None:
@@ -122,10 +157,21 @@ async def reset_location_warm() -> None:
     _location_warmed = False
 
 
-async def _scroll_for_listings(page: Page, scrolls: int = 5) -> None:
-    for i in range(scrolls):
-        await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
-        await asyncio.sleep(1.2 + (i * 0.2))
+async def _scroll_results_pane(page: Page, search_id: int, scrolls: int = 6) -> None:
+    """
+    Scroll the right-side results pane to trigger lazy-loading.
+    FB Marketplace renders listings inside an overflow:auto div, not on
+    the window — scrolling window does nothing to load more cards.
+    """
+    try:
+        scroll_target = await page.evaluate(f"{_SCROLL_JS}(6, 1200)")
+        log.info("[Search %d] Scrolled via: %s", search_id, scroll_target)
+    except Exception as exc:
+        log.warning("[Search %d] Scroll JS error: %s", search_id, exc)
+        # Fallback: plain window scroll
+        for i in range(scrolls):
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
+            await asyncio.sleep(1.2 + i * 0.2)
 
 
 async def _save_debug_screenshot(page: Page, search_id: int) -> None:
@@ -149,15 +195,16 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     log.info("[Search %d] Scanning: %s", search_id, url)
 
     try:
-        # networkidle waits until all XHR/fetch calls settle —
-        # this ensures React has finished rendering the results grid.
         await page.goto(url, wait_until="networkidle", timeout=60_000)
     except PWTimeoutError:
-        # networkidle can time out on busy pages; that's fine — cards may still be present
-        log.warning("[Search %d] networkidle timed out — querying whatever is loaded.", search_id)
+        log.warning("[Search %d] networkidle timed out — continuing.", search_id)
 
-    # Extra buffer for any deferred renders
+    # Initial render buffer
     await asyncio.sleep(2.0)
+
+    # Scroll the results pane to trigger lazy-load of listing cards
+    await _scroll_results_pane(page, search_id)
+    await asyncio.sleep(1.5)
 
     anchors = await page.query_selector_all(_CARD_SELECTOR)
     log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
@@ -174,17 +221,8 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             )
         except Exception:
             pass
-        # Save screenshot so you can see exactly what FB rendered
         await _save_debug_screenshot(page, search_id)
         return []
-
-    # Scroll to trigger lazy-loaded images/cards further down the feed
-    await _scroll_for_listings(page, scrolls=5)
-    await asyncio.sleep(1.0)
-
-    # Re-query after scroll to catch newly loaded cards
-    anchors = await page.query_selector_all(_CARD_SELECTOR)
-    log.info("[Search %d] After scroll: %d listing links.", search_id, len(anchors))
 
     new_listings: list[Listing] = []
     seen_count = 0
