@@ -3,14 +3,14 @@ Facebook Marketplace scraper.
 
 URL strategy:
   Uses /marketplace/category/search with location= zip param.
-  After navigation we WAIT for the first listing card anchor to appear
-  in the DOM before querying — FB renders via React so cards arrive
-  200-2000ms after domcontentloaded.
+  Waits for networkidle before querying so React has fully rendered.
+  Saves a screenshot to data/debug_screenshot.png on zero results.
 """
 
 import asyncio
 import logging
 import re
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -34,6 +34,7 @@ _CONDITION_MAP = {
 
 _ITEM_LINK_RE = re.compile(r"/marketplace/item/(\d+)")
 _CARD_SELECTOR = "a[href*='/marketplace/item/']"
+_SCREENSHOT_PATH = Path("data/debug_screenshot.png")
 _location_warmed: bool = False
 
 
@@ -105,14 +106,15 @@ async def _warm_location(page: Page) -> None:
     try:
         await page.goto(
             "https://www.facebook.com/marketplace/",
-            wait_until="domcontentloaded",
+            wait_until="networkidle",
             timeout=60_000,
         )
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(2.0)
         _location_warmed = True
         log.info("Marketplace session warmed.")
     except PWTimeoutError:
         log.warning("Location warmup timed out — proceeding anyway.")
+        _location_warmed = True  # don't retry every search
 
 
 async def reset_location_warm() -> None:
@@ -126,24 +128,16 @@ async def _scroll_for_listings(page: Page, scrolls: int = 5) -> None:
         await asyncio.sleep(1.2 + (i * 0.2))
 
 
-async def _wait_for_cards(page: Page, search_id: int) -> bool:
-    """
-    Wait up to 15s for the first listing card to appear in the DOM.
-    FB renders cards via React after domcontentloaded — this is the
-    key gate that prevents querying an empty feed.
-    Returns True if cards appeared, False on timeout.
-    """
+async def _save_debug_screenshot(page: Page, search_id: int) -> None:
     try:
-        await page.wait_for_selector(_CARD_SELECTOR, timeout=15_000)
-        log.info("[Search %d] Listing cards appeared in DOM.", search_id)
-        return True
-    except PWTimeoutError:
+        _SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(_SCREENSHOT_PATH), full_page=False)
         log.warning(
-            "[Search %d] Timed out waiting for listing cards. "
-            "Page may be showing no results, a captcha, or a login wall.",
-            search_id,
+            "[Search %d] Screenshot saved to %s — open it to see what FB is showing.",
+            search_id, _SCREENSHOT_PATH,
         )
-        return False
+    except Exception as exc:
+        log.warning("[Search %d] Could not save screenshot: %s", search_id, exc)
 
 
 async def scrape_search(page: Page, search: dict) -> list[Listing]:
@@ -155,15 +149,20 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     log.info("[Search %d] Scanning: %s", search_id, url)
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # networkidle waits until all XHR/fetch calls settle —
+        # this ensures React has finished rendering the results grid.
+        await page.goto(url, wait_until="networkidle", timeout=60_000)
     except PWTimeoutError:
-        log.warning("[Search %d] Page load timed out — continuing.", search_id)
+        # networkidle can time out on busy pages; that's fine — cards may still be present
+        log.warning("[Search %d] networkidle timed out — querying whatever is loaded.", search_id)
 
-    # ── KEY FIX: wait for React to inject cards before querying ──
-    cards_found = await _wait_for_cards(page, search_id)
+    # Extra buffer for any deferred renders
+    await asyncio.sleep(2.0)
 
-    if not cards_found:
-        # Diagnostic dump
+    anchors = await page.query_selector_all(_CARD_SELECTOR)
+    log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
+
+    if len(anchors) == 0:
         title = await page.title()
         log.warning("[Search %d] Zero listings — page title: '%s'", search_id, title)
         try:
@@ -171,18 +170,21 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             log.warning(
                 "[Search %d] Page snippet: %s",
                 search_id,
-                body_text[:600].replace("\n", " "),
+                body_text[:800].replace("\n", " "),
             )
         except Exception:
             pass
+        # Save screenshot so you can see exactly what FB rendered
+        await _save_debug_screenshot(page, search_id)
         return []
 
-    # Scroll to load more lazy cards now that the feed is live
+    # Scroll to trigger lazy-loaded images/cards further down the feed
     await _scroll_for_listings(page, scrolls=5)
     await asyncio.sleep(1.0)
 
+    # Re-query after scroll to catch newly loaded cards
     anchors = await page.query_selector_all(_CARD_SELECTOR)
-    log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
+    log.info("[Search %d] After scroll: %d listing links.", search_id, len(anchors))
 
     new_listings: list[Listing] = []
     seen_count = 0
