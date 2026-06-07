@@ -25,6 +25,7 @@ from db.database import (
     log_run,
     get_last_successful_run,
     mark_alerted,
+    mark_seen,
 )
 
 log = logging.getLogger(__name__)
@@ -37,12 +38,8 @@ class Scheduler:
         self._aps = AsyncIOScheduler()
         self._sem: Optional[asyncio.Semaphore] = None
         self._paused: bool = False
-        self._notifier = None   # set after construction to avoid circular import
-        self._session = None    # set after construction
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        self._notifier = None
+        self._session = None
 
     def wire(self, session_manager, notifier) -> None:
         """Inject dependencies post-construction."""
@@ -56,7 +53,7 @@ class Scheduler:
             trigger="interval",
             minutes=settings.scan_interval_minutes,
             id="scan_loop",
-            next_run_time=datetime.now(),  # run immediately on startup
+            next_run_time=datetime.now(),
         )
         self._aps.add_job(
             self._health_check,
@@ -86,10 +83,6 @@ class Scheduler:
     def paused(self) -> bool:
         return self._paused
 
-    # ------------------------------------------------------------------
-    # Main scan loop
-    # ------------------------------------------------------------------
-
     async def run_all_searches(self) -> None:
         """Fan out all enabled searches concurrently (up to max_concurrent)."""
         if self._paused:
@@ -111,21 +104,29 @@ class Scheduler:
         async with self._sem:
             search_id = search["id"]
             started_at = datetime.utcnow().isoformat()
+            alerted = 0
             try:
                 page = await self._session.get_page()
                 new_listings = await scrape_search(page, search)
 
-                # Send alerts for each new listing
                 for listing in new_listings:
                     sent = await self._notifier.send_alert(listing, search["name"])
                     if sent:
                         await mark_alerted(listing.id)
+                        await mark_seen(listing.id, search_id)
+                        alerted += 1
+                    else:
+                        # Alert failed — do NOT mark seen so it retries next scan
+                        log.warning(
+                            "[Search %d] Alert failed for listing %s — will retry next scan.",
+                            search_id, listing.id,
+                        )
 
                 await log_run(
                     search_id=search_id,
                     status="success",
                     listings_found=len(new_listings),
-                    new_listings=len(new_listings),
+                    new_listings=alerted,
                     started_at=started_at,
                 )
 
@@ -138,15 +139,11 @@ class Scheduler:
                     started_at=started_at,
                 )
 
-    # ------------------------------------------------------------------
-    # Health check
-    # ------------------------------------------------------------------
-
     async def _health_check(self) -> None:
         """Alert via Telegram if no successful run in threshold window."""
         last = await get_last_successful_run()
         if not last:
-            return  # no runs yet — bot just started
+            return
 
         last_time = datetime.fromisoformat(last["finished_at"])
         threshold = timedelta(minutes=settings.health_alert_threshold_minutes)
