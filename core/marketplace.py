@@ -45,10 +45,6 @@ _location_warmed: bool = False
 
 
 def _build_url(search: dict) -> str:
-    """
-    Build a mobile marketplace search URL.
-    m.facebook.com renders results server-side — no React, no lazy hydration.
-    """
     params: dict = {
         "query": search["keywords"],
     }
@@ -57,7 +53,6 @@ def _build_url(search: dict) -> str:
     if search.get("price_max") is not None:
         params["maxPrice"] = int(search["price_max"])
 
-    # Mobile site uses miles directly
     params["radius"] = int(search.get("distance_mi", 40))
 
     condition_val = _CONDITION_MAP.get(search.get("condition", "any"))
@@ -111,10 +106,6 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
 
 
 async def _warm_location(page: Page) -> None:
-    """
-    Visit the mobile marketplace home once to establish location cookies.
-    Only runs once per session.
-    """
     global _location_warmed
     if _location_warmed:
         return
@@ -151,6 +142,15 @@ async def _save_debug_screenshot(page: Page, search_id: int) -> None:
 
 
 async def scrape_search(page: Page, search: dict) -> list[Listing]:
+    """
+    Scrape a search and return NEW listings that passed the filter.
+
+    NOTE: mark_seen() is intentionally NOT called here for new listings.
+    The scheduler calls mark_seen() after a successful alert so that
+    a Telegram delivery failure does not permanently silence a listing.
+    Filtered-out listings are still marked seen immediately to avoid
+    re-evaluating them on every scan.
+    """
     search_id = search["id"]
 
     await _warm_location(page)
@@ -159,16 +159,13 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     log.info("[Search %d] Scanning (mobile): %s", search_id, url)
 
     try:
-        # domcontentloaded is enough — mobile site is server-rendered HTML
         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     except PWTimeoutError:
         log.warning("[Search %d] Page load timed out — continuing.", search_id)
 
-    # Small buffer for any inline scripts to run
     await asyncio.sleep(2.0)
 
-    # Mobile item links: /marketplace/item/<id>/
-    anchors = await page.query_selector_all("a[href*='/marketplace/item/']") 
+    anchors = await page.query_selector_all("a[href*='/marketplace/item/']")
     log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
 
     if len(anchors) == 0:
@@ -205,13 +202,10 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 else f"https://www.facebook.com{href.split('?')[0]}"
             )
 
-            # On the mobile site, title is usually in the direct text content
-            # of the anchor or a child element.
             title = (await anchor.inner_text()).strip().split("\n")[0]
             if not title or len(title) < 2:
                 title = "(no title)"
 
-            # Price: look for $ in the anchor text
             price: Optional[float] = None
             anchor_text = await anchor.inner_text()
             price_match = re.search(r"\$(\d[\d,]*(?:\.\d+)?)", anchor_text)
@@ -235,6 +229,7 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             )
 
             if not _passes_filter(listing, search):
+                # Filtered out — mark seen so we don't recheck every scan
                 await mark_seen(listing_id, search_id)
                 continue
 
@@ -248,7 +243,7 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 image_url=listing.image_url,
                 condition=listing.condition,
             )
-            await mark_seen(listing_id, search_id)
+            # DO NOT mark_seen here — scheduler does it after alert is sent
             new_listings.append(listing)
 
         except Exception as exc:
