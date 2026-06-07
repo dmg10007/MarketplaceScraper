@@ -32,7 +32,6 @@ async def _tg(method: str, **kwargs) -> Optional[dict]:
                 return None
             return data
     except httpx.TimeoutException:
-        # Long-poll timeout is normal — not an error
         if method == "getUpdates":
             return {"ok": True, "result": []}
         log.warning("Telegram timeout [%s]", method)
@@ -43,10 +42,6 @@ async def _tg(method: str, **kwargs) -> Optional[dict]:
 
 
 async def delete_webhook() -> None:
-    """
-    Remove any registered webhook so long-polling works.
-    Telegram blocks getUpdates while a webhook is active.
-    """
     result = await _tg("deleteWebhook", drop_pending_updates=False)
     if result:
         log.info("Telegram webhook cleared — polling mode active.")
@@ -120,6 +115,8 @@ class TelegramPoller:
         self._offset: int = 0
         self._running: bool = False
         self._task: Optional[asyncio.Task] = None
+        # Tracks pending /delete confirmations: {search_id: search_name}
+        self._pending_delete: dict[int, str] = {}
 
     async def start(self) -> None:
         await delete_webhook()
@@ -144,7 +141,7 @@ class TelegramPoller:
                 data = await _tg(
                     "getUpdates",
                     offset=self._offset,
-                    timeout=25,           # seconds Telegram holds the connection
+                    timeout=25,
                     allowed_updates=["message"],
                 )
                 if data is None:
@@ -166,22 +163,42 @@ class TelegramPoller:
 
     async def _handle_update(self, update: dict) -> None:
         msg = update.get("message", {})
-        text = msg.get("text", "").strip().lower()
+        text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
         if chat_id != str(settings.telegram_chat_id):
             return
 
-        dispatch = {
-            "/status":   self._cmd_status,
-            "/pause":    self._cmd_pause,
-            "/resume":   self._cmd_resume,
-            "/searches": self._cmd_searches,
-            "/help":     self._cmd_help,
-        }
-        handler = dispatch.get(text)
-        if handler:
-            await handler()
+        lower = text.lower()
+
+        # ── Confirmation replies for pending /delete ──
+        if lower in ("yes", "y") and self._pending_delete:
+            await self._confirm_delete()
+            return
+        if lower in ("no", "n", "cancel") and self._pending_delete:
+            self._pending_delete.clear()
+            await send_message("❌ Delete cancelled.")
+            return
+
+        # ── Routed commands ──
+        if lower in ("/status", "/status@" + lower.split("@")[-1]):
+            await self._cmd_status()
+        elif lower == "/pause":
+            await self._cmd_pause()
+        elif lower == "/resume":
+            await self._cmd_resume()
+        elif lower == "/searches":
+            await self._cmd_searches()
+        elif lower == "/help":
+            await self._cmd_help()
+        elif lower.startswith("/delete"):
+            await self._cmd_delete(text)
+        elif lower.startswith("/addsearch"):
+            await self._cmd_addsearch(text)
+
+    # ------------------------------------------------------------------ #
+    #  Commands
+    # ------------------------------------------------------------------ #
 
     async def _cmd_status(self) -> None:
         from db.database import get_run_log, get_all_searches
@@ -215,19 +232,99 @@ class TelegramPoller:
         for s in searches:
             icon = "✅" if s["enabled"] else "❌"
             lines.append(
-                f"{icon} [{s['id']}] <b>{_esc(s['name'])}</b>\n"
+                f"{icon} [<code>{s['id']}</code>] <b>{_esc(s['name'])}</b>\n"
                 f"   Keywords: {_esc(s['keywords'])}\n"
                 f"   Price: ${s['price_min'] or 0}–${s['price_max'] or '∞'}  "
-                f"Distance: {s['distance_mi']}mi"
+                f"Distance: {s['distance_mi']}mi\n"
+                f"   To delete: /delete {s['id']}"
             )
         await send_message("\n".join(lines))
+
+    async def _cmd_delete(self, text: str) -> None:
+        from db.database import get_search
+        parts = text.strip().split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await send_message(
+                "ℹ️ Usage: /delete &lt;id&gt;\n"
+                "Send /searches to see search IDs."
+            )
+            return
+
+        search_id = int(parts[1])
+        search = await get_search(search_id)
+        if not search:
+            await send_message(f"❌ No search found with ID {search_id}.")
+            return
+
+        # Stage the delete and ask for confirmation
+        self._pending_delete = {search_id: search["name"]}
+        await send_message(
+            f"⚠️ Are you sure you want to delete search [{search_id}] "
+            f"<b>{_esc(search['name'])}</b>?\n\n"
+            f"This will also remove all its listings and seen history.\n\n"
+            f"Reply <b>yes</b> to confirm or <b>no</b> to cancel."
+        )
+
+    async def _confirm_delete(self) -> None:
+        from db.database import delete_search
+        search_id, search_name = next(iter(self._pending_delete.items()))
+        self._pending_delete.clear()
+        try:
+            await delete_search(search_id)
+            await send_message(
+                f"✅ Search [{search_id}] <b>{_esc(search_name)}</b> deleted successfully.\n"
+                f"All associated listings and seen history have been removed."
+            )
+            log.info("Search %d (%s) deleted via Telegram command.", search_id, search_name)
+        except Exception as exc:
+            await send_message(f"❌ Failed to delete search: {_esc(str(exc))}")
+            log.error("Failed to delete search %d: %s", search_id, exc)
+
+    async def _cmd_addsearch(self, text: str) -> None:
+        """
+        Quick add a search from Telegram.
+        Usage: /addsearch <name> | <keywords> | <zip> | <max_price>
+        Example: /addsearch Road Bike | bike,road bike | 27330 | 400
+        """
+        from db.database import create_search
+        try:
+            _, args = text.split(None, 1)
+            parts = [p.strip() for p in args.split("|")]
+            if len(parts) < 3:
+                raise ValueError("not enough parts")
+            name = parts[0]
+            keywords = parts[1]
+            zip_code = parts[2]
+            price_max = float(parts[3]) if len(parts) > 3 else None
+            search_id = await create_search(
+                name=name,
+                keywords=keywords,
+                zip_code=zip_code,
+                price_max=price_max,
+            )
+            await send_message(
+                f"✅ Search created! ID: <code>{search_id}</code>\n"
+                f"Name: <b>{_esc(name)}</b>\n"
+                f"Keywords: {_esc(keywords)}\n"
+                f"Zip: {zip_code}  Max price: ${price_max or '∞'}\n\n"
+                f"Next scan will include this search."
+            )
+        except (ValueError, IndexError):
+            await send_message(
+                "ℹ️ <b>Usage:</b> /addsearch name | keywords | zip | max_price\n\n"
+                "<b>Example:</b>\n"
+                "/addsearch Road Bike | bike,road bike | 27330 | 400\n\n"
+                "max_price is optional."
+            )
 
     async def _cmd_help(self) -> None:
         await send_message(
             "🤖 <b>Available Commands</b>\n\n"
             "/status — bot status and last run time\n"
+            "/searches — list all searches with their IDs\n"
+            "/delete &lt;id&gt; — delete a search (asks for confirmation)\n"
+            "/addsearch name | keywords | zip | max_price — add a new search\n"
             "/pause — pause all scans\n"
             "/resume — resume scans\n"
-            "/searches — list all configured searches\n"
             "/help — show this message"
         )
