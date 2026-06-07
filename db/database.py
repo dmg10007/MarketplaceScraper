@@ -1,94 +1,94 @@
 """
-Database layer — SQLite via aiosqlite.
-Tables: searches, listings, seen_ids, run_log
+SQLite async database layer (aiosqlite).
+
+Tables:
+  searches     — user-configured search criteria
+  seen         — dedup: (listing_id, search_id) pairs
+  listings     — scraped listing records
+  run_log      — scan history for health monitoring + dashboard
 """
 
-import aiosqlite
-from pathlib import Path
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from typing import Optional
 
-DB_PATH = Path("data/marketplace.db")
+import aiosqlite
 
+from config.settings import settings
 
-CREATE_SEARCHES = """
-CREATE TABLE IF NOT EXISTS searches (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL,
-    keywords    TEXT    NOT NULL,
-    neg_keywords TEXT   NOT NULL DEFAULT '',
-    price_min   REAL,
-    price_max   REAL,
-    distance_mi INTEGER NOT NULL DEFAULT 40,
-    zip_code    TEXT    NOT NULL,
-    condition   TEXT    NOT NULL DEFAULT 'any',
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-"""
+log = logging.getLogger(__name__)
 
-CREATE_LISTINGS = """
-CREATE TABLE IF NOT EXISTS listings (
-    id          TEXT    PRIMARY KEY,
-    search_id   INTEGER NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
-    title       TEXT    NOT NULL,
-    price       REAL,
-    location    TEXT,
-    image_url   TEXT,
-    listing_url TEXT    NOT NULL,
-    condition   TEXT,
-    alerted     INTEGER NOT NULL DEFAULT 0,
-    dismissed   INTEGER NOT NULL DEFAULT 0,
-    found_at    TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-"""
-
-CREATE_SEEN_IDS = """
-CREATE TABLE IF NOT EXISTS seen_ids (
-    listing_id  TEXT    NOT NULL,
-    search_id   INTEGER NOT NULL,
-    seen_at     TEXT    NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (listing_id, search_id)
-);
-"""
-
-CREATE_RUN_LOG = """
-CREATE TABLE IF NOT EXISTS run_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER REFERENCES searches(id) ON DELETE SET NULL,
-    status      TEXT    NOT NULL,  -- 'success' | 'error' | 'skipped'
-    listings_found INTEGER NOT NULL DEFAULT 0,
-    new_listings   INTEGER NOT NULL DEFAULT 0,
-    error_msg   TEXT,
-    started_at  TEXT    NOT NULL,
-    finished_at TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-"""
+DB_PATH = settings.db_path
 
 
 async def init_db() -> None:
-    """Create tables and ensure data directory exists."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS searches (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                name          TEXT    NOT NULL,
+                keywords      TEXT    NOT NULL,
+                neg_keywords  TEXT    DEFAULT '',
+                zip_code      TEXT    NOT NULL DEFAULT '',
+                price_min     REAL,
+                price_max     REAL,
+                distance_mi   INTEGER DEFAULT 40,
+                condition     TEXT    DEFAULT 'any',
+                enabled       INTEGER DEFAULT 1,
+                created_at    TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS seen (
+                listing_id    TEXT    NOT NULL,
+                search_id     INTEGER NOT NULL,
+                dismissed     INTEGER DEFAULT 0,
+                first_seen_at TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (listing_id, search_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS listings (
+                id          TEXT    PRIMARY KEY,
+                search_id   INTEGER NOT NULL,
+                title       TEXT,
+                listing_url TEXT,
+                price       REAL,
+                location    TEXT,
+                image_url   TEXT,
+                condition   TEXT,
+                created_at  TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS run_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_id    INTEGER,
+                search_name  TEXT,
+                status       TEXT,
+                new_listings INTEGER DEFAULT 0,
+                finished_at  TEXT    DEFAULT (datetime('now'))
+            );
+        """)
+        await db.commit()
+        log.info("Database initialised at %s", DB_PATH)
+
+
+async def get_all_searches(enabled_only: bool = False) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL;")
-        await db.execute("PRAGMA foreign_keys=ON;")
-        await db.execute(CREATE_SEARCHES)
-        await db.execute(CREATE_LISTINGS)
-        await db.execute(CREATE_SEEN_IDS)
-        await db.execute(CREATE_RUN_LOG)
-        await db.commit()
+        q = "SELECT * FROM searches"
+        if enabled_only:
+            q += " WHERE enabled = 1"
+        q += " ORDER BY id"
+        async with db.execute(q) as cur:
+            return [dict(row) for row in await cur.fetchall()]
 
 
-def get_db():
-    """Async context manager — yields an open aiosqlite connection."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return aiosqlite.connect(DB_PATH)
+async def get_search(search_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM searches WHERE id = ?", (search_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
 
-
-# ---------------------------------------------------------------------------
-# Search CRUD
-# ---------------------------------------------------------------------------
 
 async def create_search(
     name: str,
@@ -100,186 +100,137 @@ async def create_search(
     distance_mi: int = 40,
     condition: str = "any",
 ) -> int:
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA foreign_keys=ON;")
-        cursor = await db.execute(
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
             """
-            INSERT INTO searches (name, keywords, neg_keywords, price_min, price_max,
-                                  distance_mi, zip_code, condition)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO searches (name, keywords, zip_code, neg_keywords,
+                                  price_min, price_max, distance_mi, condition)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
-            (name, keywords, neg_keywords, price_min, price_max, distance_mi, zip_code, condition),
+            (name, keywords, zip_code, neg_keywords, price_min, price_max, distance_mi, condition),
         )
         await db.commit()
-        return cursor.lastrowid
-
-
-async def get_all_searches(enabled_only: bool = False) -> list[dict]:
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        query = "SELECT * FROM searches"
-        if enabled_only:
-            query += " WHERE enabled = 1"
-        query += " ORDER BY id"
-        cursor = await db.execute(query)
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-
-async def get_search(search_id: int) -> Optional[dict]:
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM searches WHERE id = ?", (search_id,))
-        row = await cursor.fetchone()
-        return dict(row) if row else None
-
-
-async def update_search(search_id: int, **fields) -> None:
-    allowed = {"name", "keywords", "neg_keywords", "price_min", "price_max",
-               "distance_mi", "zip_code", "condition", "enabled"}
-    updates = {k: v for k, v in fields.items() if k in allowed}
-    if not updates:
-        return
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    async with get_db() as db:
-        await db.execute("PRAGMA foreign_keys=ON;")
-        await db.execute(
-            f"UPDATE searches SET {set_clause} WHERE id = ?",
-            (*updates.values(), search_id),
-        )
-        await db.commit()
+        log.info("Search created: [%d] %s", cur.lastrowid, name)
+        return cur.lastrowid
 
 
 async def delete_search(search_id: int) -> None:
-    async with get_db() as db:
-        await db.execute("PRAGMA foreign_keys=ON;")
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM searches WHERE id = ?", (search_id,))
+        await db.execute("DELETE FROM seen WHERE search_id = ?", (search_id,))
+        await db.execute("DELETE FROM listings WHERE search_id = ?", (search_id,))
+        await db.commit()
+        log.info("Search %d and all related data deleted.", search_id)
+
+
+async def is_seen(listing_id: str, search_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM seen WHERE listing_id = ? AND search_id = ? AND dismissed = 0",
+            (listing_id, search_id),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def mark_seen(listing_id: str, search_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO seen (listing_id, search_id) VALUES (?,?)",
+            (listing_id, search_id),
+        )
         await db.commit()
 
 
-# ---------------------------------------------------------------------------
-# Listing CRUD
-# ---------------------------------------------------------------------------
+async def dismiss_listing(listing_id: str) -> None:
+    """Mark as dismissed so it never appears again across all searches."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE seen SET dismissed = 1 WHERE listing_id = ?",
+            (listing_id,),
+        )
+        # Also insert into any searches that haven't seen it yet
+        async with db.execute("SELECT id FROM searches") as cur:
+            rows = await cur.fetchall()
+        for (sid,) in rows:
+            await db.execute(
+                "INSERT OR IGNORE INTO seen (listing_id, search_id, dismissed) VALUES (?,?,1)",
+                (listing_id, sid),
+            )
+        await db.commit()
+        log.info("Listing %s dismissed across all searches.", listing_id)
+
 
 async def upsert_listing(
     listing_id: str,
     search_id: int,
     title: str,
     listing_url: str,
-    price: Optional[float] = None,
-    location: Optional[str] = None,
-    image_url: Optional[str] = None,
-    condition: Optional[str] = None,
+    price: Optional[float],
+    location: Optional[str],
+    image_url: Optional[str],
+    condition: Optional[str],
 ) -> None:
-    async with get_db() as db:
-        await db.execute("PRAGMA foreign_keys=ON;")
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT OR IGNORE INTO listings
-                (id, search_id, title, price, location, image_url, listing_url, condition)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO listings (id, search_id, title, listing_url, price, location, image_url, condition)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                title=excluded.title, price=excluded.price,
+                location=excluded.location, image_url=excluded.image_url
             """,
-            (listing_id, search_id, title, price, location, image_url, listing_url, condition),
+            (listing_id, search_id, title, listing_url, price, location, image_url, condition),
         )
         await db.commit()
 
 
-async def is_seen(listing_id: str, search_id: int) -> bool:
-    async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT 1 FROM seen_ids WHERE listing_id = ? AND search_id = ?",
-            (listing_id, search_id),
-        )
-        return await cursor.fetchone() is not None
-
-
-async def mark_seen(listing_id: str, search_id: int) -> None:
-    async with get_db() as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO seen_ids (listing_id, search_id) VALUES (?, ?)",
-            (listing_id, search_id),
-        )
-        await db.commit()
-
-
-async def mark_alerted(listing_id: str) -> None:
-    async with get_db() as db:
-        await db.execute("UPDATE listings SET alerted = 1 WHERE id = ?", (listing_id,))
-        await db.commit()
-
-
-async def dismiss_listing(listing_id: str) -> None:
-    """Mark dismissed — suppresses future duplicate alerts for this listing."""
-    async with get_db() as db:
-        await db.execute("UPDATE listings SET dismissed = 1 WHERE id = ?", (listing_id,))
-        await db.commit()
-
-
-async def get_listings(
-    search_id: Optional[int] = None,
-    limit: int = 50,
-    offset: int = 0,
-    dismissed: bool = False,
-) -> list[dict]:
-    async with get_db() as db:
+async def get_listings(search_id: Optional[int] = None, limit: int = 50) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        where_clauses = [f"dismissed = {1 if dismissed else 0}"]
-        params: list = []
-        if search_id is not None:
-            where_clauses.append("search_id = ?")
-            params.append(search_id)
-        where = " AND ".join(where_clauses)
-        cursor = await db.execute(
-            f"SELECT * FROM listings WHERE {where} ORDER BY found_at DESC LIMIT ? OFFSET ?",
-            (*params, limit, offset),
-        )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        if search_id:
+            async with db.execute(
+                "SELECT * FROM listings WHERE search_id=? ORDER BY created_at DESC LIMIT ?",
+                (search_id, limit),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+        async with db.execute(
+            "SELECT * FROM listings ORDER BY created_at DESC LIMIT ?", (limit,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
-
-# ---------------------------------------------------------------------------
-# Run Log
-# ---------------------------------------------------------------------------
 
 async def log_run(
-    search_id: Optional[int],
+    search_id: int,
+    search_name: str,
     status: str,
-    listings_found: int = 0,
-    new_listings: int = 0,
-    error_msg: Optional[str] = None,
-    started_at: Optional[str] = None,
+    new_listings: int,
 ) -> None:
-    started = started_at or datetime.utcnow().isoformat()
-    async with get_db() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO run_log (search_id, status, listings_found, new_listings, error_msg, started_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO run_log (search_id, search_name, status, new_listings, finished_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (search_id, status, listings_found, new_listings, error_msg, started),
+            (search_id, search_name, status, new_listings,
+             datetime.now(tz=timezone.utc).isoformat()),
         )
         await db.commit()
 
 
-async def get_run_log(limit: int = 100) -> list[dict]:
-    async with get_db() as db:
+async def get_run_log(limit: int = 50) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT rl.*, s.name as search_name FROM run_log rl "
-            "LEFT JOIN searches s ON rl.search_id = s.id "
-            "ORDER BY rl.finished_at DESC LIMIT ?",
-            (limit,),
-        )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        async with db.execute(
+            "SELECT * FROM run_log ORDER BY id DESC LIMIT ?", (limit,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def get_last_successful_run() -> Optional[dict]:
-    async with get_db() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM run_log WHERE status = 'success' ORDER BY finished_at DESC LIMIT 1"
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        async with db.execute(
+            "SELECT * FROM run_log WHERE status='success' ORDER BY id DESC LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
