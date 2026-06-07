@@ -1,11 +1,16 @@
 """
-Facebook Marketplace scraper.
+Facebook Marketplace scraper — mobile site strategy.
 
-URL strategy:
-  Uses /marketplace/category/search with location= zip param.
-  Waits for networkidle, then scrolls the RIGHT-SIDE results pane
-  (not window) to trigger lazy-loading of listing cards.
-  Saves a debug screenshot to data/debug_screenshot.png on zero results.
+The desktop marketplace SPA (facebook.com/marketplace/category/search)
+detects automated browsers and silently serves an empty results grid.
+
+The MOBILE site (m.facebook.com/marketplace) renders listings as plain
+server-side HTML — no React hydration, no bot detection on the grid,
+and item anchors are present immediately after domcontentloaded.
+
+URL pattern:
+  https://m.facebook.com/marketplace/search/?query=bike&minPrice=50&maxPrice=400
+  Location is inherited from the saved session cookies (set during warmup).
 """
 
 import asyncio
@@ -33,65 +38,37 @@ _CONDITION_MAP = {
     "used": "used_good,used_fair,used_like_new",
 }
 
+# Mobile site item links look like /marketplace/item/123456789/
 _ITEM_LINK_RE = re.compile(r"/marketplace/item/(\d+)")
-_CARD_SELECTOR = "a[href*='/marketplace/item/']"
 _SCREENSHOT_PATH = Path("data/debug_screenshot.png")
 _location_warmed: bool = False
 
-# JS that finds the scrollable results pane and scrolls it.
-# FB puts listings in a div with overflow:auto/scroll to the RIGHT of the
-# filter sidebar. We find the first deeply-scrollable div that isn't the
-# sidebar itself (scrollWidth roughly equal to clientWidth, but scrollHeight
-# larger than clientHeight) and scroll it. Falls back to window.scrollBy.
-_SCROLL_JS = """
-(async (scrolls, delay) => {
-    // Find the scrollable results container.
-    // It will be a div with overflow scroll/auto whose scrollHeight > clientHeight.
-    const allDivs = Array.from(document.querySelectorAll('div'));
-    let pane = null;
-    for (const d of allDivs) {
-        const st = window.getComputedStyle(d);
-        const overflow = st.overflowY;
-        if ((overflow === 'auto' || overflow === 'scroll') &&
-            d.scrollHeight > d.clientHeight + 100 &&
-            d.clientHeight > 300) {   // tall enough to be the main results pane
-            pane = d;
-            break;
-        }
-    }
-    const target = pane || window;
-    for (let i = 0; i < scrolls; i++) {
-        if (target === window) {
-            window.scrollBy(0, window.innerHeight * 0.8);
-        } else {
-            target.scrollBy(0, target.clientHeight * 0.8);
-        }
-        await new Promise(r => setTimeout(r, delay + i * 200));
-    }
-    return pane ? 'pane' : 'window';
-})
-"""
-
 
 def _build_url(search: dict) -> str:
+    """
+    Build a mobile marketplace search URL.
+    m.facebook.com renders results server-side — no React, no lazy hydration.
+    """
     params: dict = {
-        "query":    search["keywords"],
-        "exact":    "false",
-        "location": search.get("zip_code", ""),
+        "query": search["keywords"],
     }
     if search.get("price_min") is not None:
         params["minPrice"] = int(search["price_min"])
     if search.get("price_max") is not None:
         params["maxPrice"] = int(search["price_max"])
 
-    distance_km = round(search.get("distance_mi", 40) * _MI_TO_KM)
-    params["radius"] = distance_km
+    # Mobile site uses miles directly
+    params["radius"] = int(search.get("distance_mi", 40))
 
     condition_val = _CONDITION_MAP.get(search.get("condition", "any"))
     if condition_val:
         params["itemCondition"] = condition_val
 
-    return f"https://www.facebook.com/marketplace/category/search?{urlencode(params)}"
+    zip_code = search.get("zip_code", "")
+    if zip_code:
+        params["location"] = zip_code
+
+    return f"https://m.facebook.com/marketplace/search/?{urlencode(params)}"
 
 
 def _extract_id_from_url(href: str) -> Optional[str]:
@@ -134,21 +111,25 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
 
 
 async def _warm_location(page: Page) -> None:
+    """
+    Visit the mobile marketplace home once to establish location cookies.
+    Only runs once per session.
+    """
     global _location_warmed
     if _location_warmed:
         return
-    log.info("Warming Marketplace session...")
+    log.info("Warming mobile Marketplace session...")
     try:
         await page.goto(
-            "https://www.facebook.com/marketplace/",
-            wait_until="networkidle",
+            "https://m.facebook.com/marketplace/",
+            wait_until="domcontentloaded",
             timeout=60_000,
         )
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(3.0)
         _location_warmed = True
-        log.info("Marketplace session warmed.")
+        log.info("Mobile Marketplace session warmed.")
     except PWTimeoutError:
-        log.warning("Location warmup timed out — proceeding anyway.")
+        log.warning("Warmup timed out — proceeding anyway.")
         _location_warmed = True
 
 
@@ -157,29 +138,12 @@ async def reset_location_warm() -> None:
     _location_warmed = False
 
 
-async def _scroll_results_pane(page: Page, search_id: int, scrolls: int = 6) -> None:
-    """
-    Scroll the right-side results pane to trigger lazy-loading.
-    FB Marketplace renders listings inside an overflow:auto div, not on
-    the window — scrolling window does nothing to load more cards.
-    """
-    try:
-        scroll_target = await page.evaluate(f"{_SCROLL_JS}(6, 1200)")
-        log.info("[Search %d] Scrolled via: %s", search_id, scroll_target)
-    except Exception as exc:
-        log.warning("[Search %d] Scroll JS error: %s", search_id, exc)
-        # Fallback: plain window scroll
-        for i in range(scrolls):
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
-            await asyncio.sleep(1.2 + i * 0.2)
-
-
 async def _save_debug_screenshot(page: Page, search_id: int) -> None:
     try:
         _SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        await page.screenshot(path=str(_SCREENSHOT_PATH), full_page=False)
+        await page.screenshot(path=str(_SCREENSHOT_PATH), full_page=True)
         log.warning(
-            "[Search %d] Screenshot saved to %s — open it to see what FB is showing.",
+            "[Search %d] Screenshot saved to %s — open it to see what FB rendered.",
             search_id, _SCREENSHOT_PATH,
         )
     except Exception as exc:
@@ -192,21 +156,19 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     await _warm_location(page)
 
     url = _build_url(search)
-    log.info("[Search %d] Scanning: %s", search_id, url)
+    log.info("[Search %d] Scanning (mobile): %s", search_id, url)
 
     try:
-        await page.goto(url, wait_until="networkidle", timeout=60_000)
+        # domcontentloaded is enough — mobile site is server-rendered HTML
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     except PWTimeoutError:
-        log.warning("[Search %d] networkidle timed out — continuing.", search_id)
+        log.warning("[Search %d] Page load timed out — continuing.", search_id)
 
-    # Initial render buffer
+    # Small buffer for any inline scripts to run
     await asyncio.sleep(2.0)
 
-    # Scroll the results pane to trigger lazy-load of listing cards
-    await _scroll_results_pane(page, search_id)
-    await asyncio.sleep(1.5)
-
-    anchors = await page.query_selector_all(_CARD_SELECTOR)
+    # Mobile item links: /marketplace/item/<id>/
+    anchors = await page.query_selector_all("a[href*='/marketplace/item/']") 
     log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
 
     if len(anchors) == 0:
@@ -243,23 +205,20 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 else f"https://www.facebook.com{href.split('?')[0]}"
             )
 
-            spans = await anchor.query_selector_all("span[dir='auto']")
-
-            title = ""
-            for span in spans:
-                text = (await span.inner_text()).strip()
-                if text and len(text) > 2:
-                    title = text
-                    break
-            if not title:
+            # On the mobile site, title is usually in the direct text content
+            # of the anchor or a child element.
+            title = (await anchor.inner_text()).strip().split("\n")[0]
+            if not title or len(title) < 2:
                 title = "(no title)"
 
+            # Price: look for $ in the anchor text
             price: Optional[float] = None
-            for span in spans:
-                text = (await span.inner_text()).strip()
-                if "$" in text or "free" in text.lower():
-                    price = _parse_price(text)
-                    break
+            anchor_text = await anchor.inner_text()
+            price_match = re.search(r"\$(\d[\d,]*(?:\.\d+)?)", anchor_text)
+            if price_match:
+                price = _parse_price(price_match.group(0))
+            elif "free" in anchor_text.lower():
+                price = 0.0
 
             image_url: Optional[str] = None
             img = await anchor.query_selector("img")
