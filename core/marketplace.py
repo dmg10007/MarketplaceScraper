@@ -1,20 +1,16 @@
 """
 Facebook Marketplace scraper — mobile site strategy.
 
-The desktop marketplace SPA (facebook.com/marketplace/category/search)
-detects automated browsers and silently serves an empty results grid.
-
-The MOBILE site (m.facebook.com/marketplace) renders listings as plain
-server-side HTML — no React hydration, no bot detection on the grid,
-and item anchors are present immediately after domcontentloaded.
-
-URL pattern:
-  https://m.facebook.com/marketplace/search/?query=bike&minPrice=50&maxPrice=400
-  Location is inherited from the saved session cookies (set during warmup).
+Phase 5 hardening:
+  - Random jitter (2-8s) between navigations
+  - Human-like scroll simulation before parsing
+  - Session expiry detection via page title
+  - Proxy support via PROXY_URL in .env
 """
 
 import asyncio
 import logging
+import random
 import re
 from pathlib import Path
 from typing import Optional
@@ -27,8 +23,6 @@ from db.database import is_seen, mark_seen, upsert_listing
 
 log = logging.getLogger(__name__)
 
-_MI_TO_KM = 1.60934
-
 _CONDITION_MAP = {
     "any": None,
     "new": "new",
@@ -38,31 +32,23 @@ _CONDITION_MAP = {
     "used": "used_good,used_fair,used_like_new",
 }
 
-# Mobile site item links look like /marketplace/item/123456789/
 _ITEM_LINK_RE = re.compile(r"/marketplace/item/(\d+)")
 _SCREENSHOT_PATH = Path("data/debug_screenshot.png")
 _location_warmed: bool = False
 
 
 def _build_url(search: dict) -> str:
-    params: dict = {
-        "query": search["keywords"],
-    }
+    params: dict = {"query": search["keywords"]}
     if search.get("price_min") is not None:
         params["minPrice"] = int(search["price_min"])
     if search.get("price_max") is not None:
         params["maxPrice"] = int(search["price_max"])
-
     params["radius"] = int(search.get("distance_mi", 40))
-
     condition_val = _CONDITION_MAP.get(search.get("condition", "any"))
     if condition_val:
         params["itemCondition"] = condition_val
-
-    zip_code = search.get("zip_code", "")
-    if zip_code:
-        params["location"] = zip_code
-
+    if search.get("zip_code"):
+        params["location"] = search["zip_code"]
     return f"https://m.facebook.com/marketplace/search/?{urlencode(params)}"
 
 
@@ -83,26 +69,47 @@ def _parse_price(text: str) -> Optional[float]:
 
 def _passes_filter(listing: Listing, search: dict) -> bool:
     title_lower = listing.title.lower()
-
     for kw in [k.strip().lower() for k in search["keywords"].split(",") if k.strip()]:
         if not any(word in title_lower for word in kw.split()):
-            log.debug("Filter FAIL keyword '%s' not in '%s'", kw, listing.title)
             return False
-
     neg_raw = search.get("neg_keywords", "")
     if neg_raw:
         for neg in [n.strip().lower() for n in neg_raw.split(",") if n.strip()]:
             if neg in title_lower:
-                log.debug("Filter FAIL neg keyword '%s' in '%s'", neg, listing.title)
                 return False
-
     if listing.price is not None:
         if search.get("price_min") and listing.price < search["price_min"]:
             return False
         if search.get("price_max") and listing.price > search["price_max"]:
             return False
-
     return True
+
+
+async def _jitter(short: bool = False) -> None:
+    """Phase 5: random delay to mimic human browsing pace."""
+    lo, hi = (0.5, 2.0) if short else (2.0, 8.0)
+    await asyncio.sleep(random.uniform(lo, hi))
+
+
+async def _human_scroll(page: Page) -> None:
+    """Phase 5: scroll down in steps to trigger lazy-loaded content."""
+    try:
+        for _ in range(random.randint(3, 6)):
+            dist = random.randint(300, 700)
+            await page.evaluate(f"window.scrollBy(0, {dist})")
+            await asyncio.sleep(random.uniform(0.4, 1.2))
+        await page.evaluate("window.scrollBy(0, -200)")
+    except Exception:
+        pass
+
+
+async def _session_still_valid(page: Page) -> bool:
+    """Phase 5: detect FB logout / checkpoint via page title."""
+    try:
+        title = (await page.title()).lower()
+        return not any(b in title for b in ("log in", "log into", "checkpoint"))
+    except Exception:
+        return True
 
 
 async def _warm_location(page: Page) -> None:
@@ -116,7 +123,7 @@ async def _warm_location(page: Page) -> None:
             wait_until="domcontentloaded",
             timeout=60_000,
         )
-        await asyncio.sleep(3.0)
+        await _jitter()
         _location_warmed = True
         log.info("Mobile Marketplace session warmed.")
     except PWTimeoutError:
@@ -133,27 +140,23 @@ async def _save_debug_screenshot(page: Page, search_id: int) -> None:
     try:
         _SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
         await page.screenshot(path=str(_SCREENSHOT_PATH), full_page=True)
-        log.warning(
-            "[Search %d] Screenshot saved to %s — open it to see what FB rendered.",
-            search_id, _SCREENSHOT_PATH,
-        )
+        log.warning("[Search %d] Screenshot -> %s", search_id, _SCREENSHOT_PATH)
     except Exception as exc:
-        log.warning("[Search %d] Could not save screenshot: %s", search_id, exc)
+        log.warning("[Search %d] Screenshot failed: %s", search_id, exc)
 
 
 async def scrape_search(page: Page, search: dict) -> list[Listing]:
     """
-    Scrape a search and return NEW listings that passed the filter.
-
-    NOTE: mark_seen() is intentionally NOT called here for new listings.
-    The scheduler calls mark_seen() after a successful alert so that
-    a Telegram delivery failure does not permanently silence a listing.
-    Filtered-out listings are still marked seen immediately to avoid
-    re-evaluating them on every scan.
+    Scrape and return NEW listings that passed filtering.
+    mark_seen() is NOT called for new listings here — scheduler calls it
+    after a successful alert. Filtered-out listings are marked seen immediately.
     """
     search_id = search["id"]
-
     await _warm_location(page)
+
+    if not await _session_still_valid(page):
+        log.warning("[Search %d] Session appears expired — skipping scan.", search_id)
+        return []
 
     url = _build_url(search)
     log.info("[Search %d] Scanning (mobile): %s", search_id, url)
@@ -163,7 +166,7 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     except PWTimeoutError:
         log.warning("[Search %d] Page load timed out — continuing.", search_id)
 
-    await asyncio.sleep(2.0)
+    await _human_scroll(page)
 
     anchors = await page.query_selector_all("a[href*='/marketplace/item/']")
     log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
@@ -173,11 +176,7 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
         log.warning("[Search %d] Zero listings — page title: '%s'", search_id, title)
         try:
             body_text = await page.inner_text("body")
-            log.warning(
-                "[Search %d] Page snippet: %s",
-                search_id,
-                body_text[:800].replace("\n", " "),
-            )
+            log.warning("[Search %d] Snippet: %s", search_id, body_text[:500].replace("\n", " "))
         except Exception:
             pass
         await _save_debug_screenshot(page, search_id)
@@ -202,12 +201,12 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 else f"https://www.facebook.com{href.split('?')[0]}"
             )
 
-            title = (await anchor.inner_text()).strip().split("\n")[0]
+            anchor_text = await anchor.inner_text()
+            title = anchor_text.strip().split("\n")[0]
             if not title or len(title) < 2:
                 title = "(no title)"
 
             price: Optional[float] = None
-            anchor_text = await anchor.inner_text()
             price_match = re.search(r"\$(\d[\d,]*(?:\.\d+)?)", anchor_text)
             if price_match:
                 price = _parse_price(price_match.group(0))
@@ -229,7 +228,6 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             )
 
             if not _passes_filter(listing, search):
-                # Filtered out — mark seen so we don't recheck every scan
                 await mark_seen(listing_id, search_id)
                 continue
 
@@ -243,15 +241,13 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 image_url=listing.image_url,
                 condition=listing.condition,
             )
-            # DO NOT mark_seen here — scheduler does it after alert is sent
+            # DO NOT mark_seen here — scheduler does it after alert succeeds
             new_listings.append(listing)
+            await _jitter(short=True)
 
         except Exception as exc:
             log.warning("[Search %d] Error parsing card: %s", search_id, exc)
             continue
 
-    log.info(
-        "[Search %d] Done — %d new, %d already seen.",
-        search_id, len(new_listings), seen_count,
-    )
+    log.info("[Search %d] Done — %d new, %d already seen.", search_id, len(new_listings), seen_count)
     return new_listings

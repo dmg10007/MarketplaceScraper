@@ -1,5 +1,9 @@
 """
 Telegram notifier + command handler.
+
+Public surface:
+  Notifier       — injectable class with send_alert / send_message / send_health_alert
+  TelegramPoller — long-poll loop + bot command dispatch
 """
 
 import asyncio
@@ -17,7 +21,6 @@ TG_BASE = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
 
 
 async def _tg(method: str, **kwargs) -> Optional[dict]:
-    """Make a Telegram Bot API call. Returns parsed JSON or None on error."""
     try:
         async with httpx.AsyncClient(timeout=35) as client:
             r = await client.post(f"{TG_BASE}/{method}", json=kwargs)
@@ -25,8 +28,7 @@ async def _tg(method: str, **kwargs) -> Optional[dict]:
             if not data.get("ok"):
                 log.warning(
                     "Telegram API error [%s] %d: %s",
-                    method,
-                    r.status_code,
+                    method, r.status_code,
                     data.get("description", "no description"),
                 )
                 return None
@@ -46,55 +48,7 @@ async def delete_webhook() -> None:
     if result:
         log.info("Telegram webhook cleared — polling mode active.")
     else:
-        log.warning("Could not clear Telegram webhook (may already be clear).")
-
-
-async def send_alert(listing: Listing, search_name: str) -> bool:
-    price_str = listing.price_display()
-    location_str = listing.location or "Location unknown"
-    condition_str = listing.condition or "Not specified"
-
-    caption = (
-        f"📦 <b>{_esc(listing.title)}</b>\n"
-        f"💰 <b>{_esc(price_str)}</b>\n"
-        f"📍 {_esc(location_str)}\n"
-        f"⭐ {_esc(condition_str)}\n"
-        f"🔍 Search: <i>{_esc(search_name)}</i>\n\n"
-        f'<a href="{listing.listing_url}">Open on Facebook Marketplace →</a>'
-    )
-
-    if listing.image_url:
-        result = await _tg(
-            "sendPhoto",
-            chat_id=settings.telegram_chat_id,
-            photo=listing.image_url,
-            caption=caption,
-            parse_mode="HTML",
-        )
-    else:
-        result = await _tg(
-            "sendMessage",
-            chat_id=settings.telegram_chat_id,
-            text=caption,
-            parse_mode="HTML",
-            disable_web_page_preview=False,
-        )
-
-    return result is not None
-
-
-async def send_message(text: str) -> bool:
-    result = await _tg(
-        "sendMessage",
-        chat_id=settings.telegram_chat_id,
-        text=text,
-        parse_mode="HTML",
-    )
-    return result is not None
-
-
-async def send_health_alert(message: str) -> bool:
-    return await send_message(f"⚠️ <b>MarketplaceScraper Alert</b>\n\n{message}")
+        log.warning("Could not clear Telegram webhook.")
 
 
 def _esc(text: str) -> str:
@@ -103,6 +57,97 @@ def _esc(text: str) -> str:
             .replace("<", "&lt;")
             .replace(">", "&gt;")
     )
+
+
+# ---------------------------------------------------------------------------
+# Notifier — injectable class used by Scheduler
+# ---------------------------------------------------------------------------
+
+class Notifier:
+    """
+    Injected into Scheduler via scheduler.wire().
+    Exposes send_alert / send_message / send_health_alert.
+    """
+
+    async def send_alert(self, listing: Listing, search_name: str) -> bool:
+        price_str = listing.price_display()
+        location_str = listing.location or "Location unknown"
+        condition_str = listing.condition or "Not specified"
+
+        caption = (
+            f"\U0001f3f7\ufe0f <b>{_esc(listing.title)}</b>\n"
+            f"\U0001f4b0 <b>{_esc(price_str)}</b>\n"
+            f"\U0001f4cd {_esc(location_str)}\n"
+            f"\u2b50 Condition: {_esc(condition_str)}\n"
+            f"\U0001f50d Search: <i>{_esc(search_name)}</i>\n\n"
+            f"<a href=\"{listing.listing_url}\">\U0001f4f2 Open on Facebook Marketplace \u2192</a>"
+        )
+
+        reply_markup = {
+            "inline_keyboard": [[
+                {"text": "Open in FB Marketplace", "url": listing.listing_url}
+            ]]
+        }
+
+        if listing.image_url:
+            result = await _tg(
+                "sendPhoto",
+                chat_id=settings.telegram_chat_id,
+                photo=listing.image_url,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            if result is None:
+                result = await _tg(
+                    "sendMessage",
+                    chat_id=settings.telegram_chat_id,
+                    text=caption,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False,
+                    reply_markup=reply_markup,
+                )
+        else:
+            result = await _tg(
+                "sendMessage",
+                chat_id=settings.telegram_chat_id,
+                text=caption,
+                parse_mode="HTML",
+                disable_web_page_preview=False,
+                reply_markup=reply_markup,
+            )
+
+        if result:
+            log.info("Alert sent: %s (%s)", listing.title, price_str)
+        else:
+            log.warning("Alert FAILED for listing %s", listing.id)
+        return result is not None
+
+    async def send_message(self, text: str) -> bool:
+        result = await _tg(
+            "sendMessage",
+            chat_id=settings.telegram_chat_id,
+            text=text,
+            parse_mode="HTML",
+        )
+        return result is not None
+
+    async def send_health_alert(self, message: str) -> bool:
+        return await self.send_message(
+            f"\u26a0\ufe0f <b>MarketplaceScraper Alert</b>\n\n{message}"
+        )
+
+
+# Module-level singleton used by TelegramPoller command handlers
+_notifier = Notifier()
+
+
+async def send_message(text: str) -> bool:
+    return await _notifier.send_message(text)
+
+
+async def send_health_alert(message: str) -> bool:
+    return await _notifier.send_health_alert(message)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +160,6 @@ class TelegramPoller:
         self._offset: int = 0
         self._running: bool = False
         self._task: Optional[asyncio.Task] = None
-        # Tracks pending /delete confirmations: {search_id: search_name}
         self._pending_delete: dict[int, str] = {}
 
     async def start(self) -> None:
@@ -148,12 +192,10 @@ class TelegramPoller:
                     await asyncio.sleep(min(backoff, 60))
                     backoff = min(backoff * 2, 60)
                     continue
-
                 backoff = 1
                 for update in data.get("result", []):
                     self._offset = update["update_id"] + 1
                     await self._handle_update(update)
-
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -171,43 +213,31 @@ class TelegramPoller:
 
         lower = text.lower()
 
-        # ── Confirmation replies for pending /delete ──
         if lower in ("yes", "y") and self._pending_delete:
             await self._confirm_delete()
             return
         if lower in ("no", "n", "cancel") and self._pending_delete:
             self._pending_delete.clear()
-            await send_message("❌ Delete cancelled.")
+            await _notifier.send_message("\u274c Delete cancelled.")
             return
 
-        # ── Routed commands ──
-        if lower in ("/status", "/status@" + lower.split("@")[-1]):
-            await self._cmd_status()
-        elif lower == "/pause":
-            await self._cmd_pause()
-        elif lower == "/resume":
-            await self._cmd_resume()
-        elif lower == "/searches":
-            await self._cmd_searches()
-        elif lower == "/help":
-            await self._cmd_help()
-        elif lower.startswith("/delete"):
-            await self._cmd_delete(text)
-        elif lower.startswith("/addsearch"):
-            await self._cmd_addsearch(text)
-
-    # ------------------------------------------------------------------ #
-    #  Commands
-    # ------------------------------------------------------------------ #
+        if lower == "/status":           await self._cmd_status()
+        elif lower == "/pause":           await self._cmd_pause()
+        elif lower == "/resume":          await self._cmd_resume()
+        elif lower == "/searches":        await self._cmd_searches()
+        elif lower == "/scan":            await self._cmd_scan()
+        elif lower == "/help":            await self._cmd_help()
+        elif lower.startswith("/delete"): await self._cmd_delete(text)
+        elif lower.startswith("/addsearch"): await self._cmd_addsearch(text)
 
     async def _cmd_status(self) -> None:
         from db.database import get_run_log, get_all_searches
         searches = await get_all_searches(enabled_only=True)
         log_entries = await get_run_log(limit=1)
         last_run = log_entries[0].get("finished_at", "Unknown") if log_entries else "Never"
-        status_icon = "⏸️ Paused" if self._scheduler.paused else "▶️ Running"
-        await send_message(
-            f"🤖 <b>MarketplaceScraper Status</b>\n\n"
+        status_icon = "\u23f8\ufe0f Paused" if self._scheduler.paused else "\u25b6\ufe0f Running"
+        await _notifier.send_message(
+            f"\U0001f916 <b>MarketplaceScraper Status</b>\n\n"
             f"Status: {status_icon}\n"
             f"Active searches: {len(searches)}\n"
             f"Scan interval: {settings.scan_interval_minutes} min\n"
@@ -216,53 +246,52 @@ class TelegramPoller:
 
     async def _cmd_pause(self) -> None:
         self._scheduler.pause()
-        await send_message("⏸️ Scheduler paused. Send /resume to restart scans.")
+        await _notifier.send_message("\u23f8\ufe0f Scheduler paused. Send /resume to restart.")
 
     async def _cmd_resume(self) -> None:
         self._scheduler.resume()
-        await send_message("▶️ Scheduler resumed. Next scan starting shortly.")
+        await _notifier.send_message("\u25b6\ufe0f Scheduler resumed.")
+
+    async def _cmd_scan(self) -> None:
+        await _notifier.send_message("\U0001f50d Manual scan triggered...")
+        asyncio.create_task(self._scheduler.run_all_searches())
 
     async def _cmd_searches(self) -> None:
         from db.database import get_all_searches
         searches = await get_all_searches()
         if not searches:
-            await send_message("No searches configured yet.")
+            await _notifier.send_message("No searches configured yet.")
             return
         lines = ["<b>Configured Searches</b>\n"]
         for s in searches:
-            icon = "✅" if s["enabled"] else "❌"
+            icon = "\u2705" if s["enabled"] else "\u274c"
             lines.append(
                 f"{icon} [<code>{s['id']}</code>] <b>{_esc(s['name'])}</b>\n"
                 f"   Keywords: {_esc(s['keywords'])}\n"
-                f"   Price: ${s['price_min'] or 0}–${s['price_max'] or '∞'}  "
-                f"Distance: {s['distance_mi']}mi\n"
-                f"   To delete: /delete {s['id']}"
+                f"   Price: ${s['price_min'] or 0}\u2013${s['price_max'] or '\u221e'}  "
+                f"Radius: {s['distance_mi']}mi\n"
+                f"   /delete {s['id']} to remove"
             )
-        await send_message("\n".join(lines))
+        await _notifier.send_message("\n".join(lines))
 
     async def _cmd_delete(self, text: str) -> None:
         from db.database import get_search
         parts = text.strip().split()
         if len(parts) < 2 or not parts[1].isdigit():
-            await send_message(
-                "ℹ️ Usage: /delete &lt;id&gt;\n"
-                "Send /searches to see search IDs."
+            await _notifier.send_message(
+                "\u2139\ufe0f Usage: /delete &lt;id&gt;\nSend /searches to see IDs."
             )
             return
-
         search_id = int(parts[1])
         search = await get_search(search_id)
         if not search:
-            await send_message(f"❌ No search found with ID {search_id}.")
+            await _notifier.send_message(f"\u274c No search found with ID {search_id}.")
             return
-
-        # Stage the delete and ask for confirmation
         self._pending_delete = {search_id: search["name"]}
-        await send_message(
-            f"⚠️ Are you sure you want to delete search [{search_id}] "
-            f"<b>{_esc(search['name'])}</b>?\n\n"
-            f"This will also remove all its listings and seen history.\n\n"
-            f"Reply <b>yes</b> to confirm or <b>no</b> to cancel."
+        await _notifier.send_message(
+            f"\u26a0\ufe0f Delete search [{search_id}] <b>{_esc(search['name'])}</b>?\n\n"
+            f"Removes all listings + seen history.\n"
+            f"Reply <b>yes</b> or <b>no</b>."
         )
 
     async def _confirm_delete(self) -> None:
@@ -271,60 +300,47 @@ class TelegramPoller:
         self._pending_delete.clear()
         try:
             await delete_search(search_id)
-            await send_message(
-                f"✅ Search [{search_id}] <b>{_esc(search_name)}</b> deleted successfully.\n"
-                f"All associated listings and seen history have been removed."
+            await _notifier.send_message(
+                f"\u2705 Search [{search_id}] <b>{_esc(search_name)}</b> deleted.\n"
+                f"All listings and seen history removed."
             )
-            log.info("Search %d (%s) deleted via Telegram command.", search_id, search_name)
         except Exception as exc:
-            await send_message(f"❌ Failed to delete search: {_esc(str(exc))}")
-            log.error("Failed to delete search %d: %s", search_id, exc)
+            await _notifier.send_message(f"\u274c Delete failed: {_esc(str(exc))}")
 
     async def _cmd_addsearch(self, text: str) -> None:
-        """
-        Quick add a search from Telegram.
-        Usage: /addsearch <name> | <keywords> | <zip> | <max_price>
-        Example: /addsearch Road Bike | bike,road bike | 27330 | 400
-        """
         from db.database import create_search
         try:
             _, args = text.split(None, 1)
             parts = [p.strip() for p in args.split("|")]
             if len(parts) < 3:
-                raise ValueError("not enough parts")
-            name = parts[0]
-            keywords = parts[1]
-            zip_code = parts[2]
+                raise ValueError
+            name, keywords, zip_code = parts[0], parts[1], parts[2]
             price_max = float(parts[3]) if len(parts) > 3 else None
             search_id = await create_search(
-                name=name,
-                keywords=keywords,
-                zip_code=zip_code,
-                price_max=price_max,
+                name=name, keywords=keywords,
+                zip_code=zip_code, price_max=price_max,
             )
-            await send_message(
-                f"✅ Search created! ID: <code>{search_id}</code>\n"
-                f"Name: <b>{_esc(name)}</b>\n"
-                f"Keywords: {_esc(keywords)}\n"
-                f"Zip: {zip_code}  Max price: ${price_max or '∞'}\n\n"
+            await _notifier.send_message(
+                f"\u2705 Search created! ID: <code>{search_id}</code>\n"
+                f"Name: <b>{_esc(name)}</b>  Keywords: {_esc(keywords)}\n"
+                f"Zip: {zip_code}  Max: ${price_max or '\u221e'}\n"
                 f"Next scan will include this search."
             )
         except (ValueError, IndexError):
-            await send_message(
-                "ℹ️ <b>Usage:</b> /addsearch name | keywords | zip | max_price\n\n"
-                "<b>Example:</b>\n"
-                "/addsearch Road Bike | bike,road bike | 27330 | 400\n\n"
-                "max_price is optional."
+            await _notifier.send_message(
+                "\u2139\ufe0f <b>Usage:</b> /addsearch name | keywords | zip | max_price\n\n"
+                "<b>Example:</b>\n/addsearch Road Bike | bike | 27330 | 400"
             )
 
     async def _cmd_help(self) -> None:
-        await send_message(
-            "🤖 <b>Available Commands</b>\n\n"
-            "/status — bot status and last run time\n"
-            "/searches — list all searches with their IDs\n"
-            "/delete &lt;id&gt; — delete a search (asks for confirmation)\n"
-            "/addsearch name | keywords | zip | max_price — add a new search\n"
-            "/pause — pause all scans\n"
-            "/resume — resume scans\n"
-            "/help — show this message"
+        await _notifier.send_message(
+            "\U0001f916 <b>Available Commands</b>\n\n"
+            "/status — bot status and last run\n"
+            "/searches — list searches with IDs\n"
+            "/scan — trigger an immediate scan\n"
+            "/delete &lt;id&gt; — delete a search (asks confirmation)\n"
+            "/addsearch name | keywords | zip | max — add a search\n"
+            "/pause — pause scanning\n"
+            "/resume — resume scanning\n"
+            "/help — this message"
         )
