@@ -42,6 +42,19 @@ async def _tg(method: str, **kwargs) -> Optional[dict]:
         return None
 
 
+async def delete_webhook() -> None:
+    """
+    Remove any registered webhook so long-polling works.
+    Telegram does not allow getUpdates while a webhook is set.
+    Safe to call even if no webhook is registered.
+    """
+    result = await _tg("deleteWebhook", drop_pending_updates=False)
+    if result:
+        log.info("Telegram webhook cleared — polling mode active.")
+    else:
+        log.warning("Could not clear Telegram webhook (may already be clear).")
+
+
 async def send_alert(listing: Listing, search_name: str) -> bool:
     """
     Send a rich Telegram alert for a new listing.
@@ -117,12 +130,14 @@ class TelegramPoller:
     """
 
     def __init__(self, scheduler) -> None:
-        self._scheduler = scheduler  # reference to Scheduler instance
+        self._scheduler = scheduler
         self._offset: int = 0
         self._running: bool = False
         self._task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
+        # Must delete any registered webhook before polling will work
+        await delete_webhook()
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
         log.info("Telegram command poller started.")
@@ -138,6 +153,7 @@ class TelegramPoller:
         log.info("Telegram command poller stopped.")
 
     async def _poll_loop(self) -> None:
+        backoff = 1
         while self._running:
             try:
                 data = await _tg(
@@ -146,22 +162,30 @@ class TelegramPoller:
                     timeout=30,
                     allowed_updates=["message"],
                 )
-                if data and data.get("result"):
+                if data is None:
+                    # API error — back off before retrying
+                    await asyncio.sleep(min(backoff, 60))
+                    backoff = min(backoff * 2, 60)
+                    continue
+
+                backoff = 1  # reset on success
+                if data.get("result"):
                     for update in data["result"]:
                         self._offset = update["update_id"] + 1
                         await self._handle_update(update)
+
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.warning("Telegram poll error: %s", exc)
-                await asyncio.sleep(5)
+                await asyncio.sleep(min(backoff, 60))
+                backoff = min(backoff * 2, 60)
 
     async def _handle_update(self, update: dict) -> None:
         msg = update.get("message", {})
         text = msg.get("text", "").strip().lower()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        # Only respond to the configured chat
         if chat_id != str(settings.telegram_chat_id):
             return
 
@@ -177,10 +201,9 @@ class TelegramPoller:
             await self._cmd_help()
 
     async def _cmd_status(self) -> None:
-        from db.database import get_run_log, get_all_searches, get_listings
+        from db.database import get_run_log, get_all_searches
         searches = await get_all_searches(enabled_only=True)
         log_entries = await get_run_log(limit=1)
-        listings = await get_listings(limit=1)
 
         last_run = "Never"
         if log_entries:

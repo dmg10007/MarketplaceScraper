@@ -2,6 +2,7 @@
 Facebook Marketplace scraper.
 
 Responsibilities:
+  - Warm location context by visiting /marketplace before each search
   - Build search URLs from Search config
   - Navigate to Marketplace search results via Playwright
   - Extract listing cards (id, title, price, location, image, condition)
@@ -31,32 +32,24 @@ from db.database import is_seen, mark_seen, upsert_listing
 
 log = logging.getLogger(__name__)
 
-# Miles → km conversion (FB radius param is in km)
 _MI_TO_KM = 1.60934
 
-# Condition map: our internal names → FB URL param values
 _CONDITION_MAP = {
     "any": None,
     "new": "new",
     "used_like_new": "used_like_new",
     "used_good": "used_good",
     "used_fair": "used_fair",
-    "used": "used_good,used_fair,used_like_new",  # any used
+    "used": "used_good,used_fair,used_like_new",
 }
 
-# Selectors — FB uses minified/dynamic class names so we target
-# structural/ARIA attributes that are stable across deploys.
-_LISTING_CONTAINER = "div[data-testid='marketplace_search_feed']"
-_LISTING_CARDS     = "div[data-testid='marketplace_search_feed'] > div > div > div > a[href*='/marketplace/item/']"
-_CARD_TITLE        = "span[dir='auto']"
-_CARD_PRICE        = "span[dir='auto']"
-
-# Fallback: grab all anchor tags pointing to marketplace items
 _ITEM_LINK_RE = re.compile(r"/marketplace/item/(\d+)")
+
+# Track whether we've warmed location this session
+_location_warmed: bool = False
 
 
 def _build_url(search: dict) -> str:
-    """Construct the FB Marketplace search URL from a search config dict."""
     params: dict = {
         "query": search["keywords"],
         "exact": "false",
@@ -85,7 +78,6 @@ def _extract_id_from_url(href: str) -> Optional[str]:
 
 
 def _parse_price(text: str) -> Optional[float]:
-    """Extract first numeric price from a string like '$1,200' or 'Free'."""
     text = text.replace(",", "")
     m = re.search(r"\$(\d+(?:\.\d+)?)", text)
     if m:
@@ -96,18 +88,14 @@ def _parse_price(text: str) -> Optional[float]:
 
 
 def _passes_filter(listing: Listing, search: dict) -> bool:
-    """Return True if listing passes all search criteria."""
     title_lower = listing.title.lower()
 
-    # Keyword match (all keywords must appear in title)
     keywords = [k.strip().lower() for k in search["keywords"].split(",") if k.strip()]
     for kw in keywords:
-        # Allow multi-word keywords as phrase match
         if not any(word in title_lower for word in kw.split()):
             log.debug("Filter FAIL keyword '%s' not in '%s'", kw, listing.title)
             return False
 
-    # Negative keywords (any match = reject)
     neg_raw = search.get("neg_keywords", "")
     if neg_raw:
         neg_keywords = [n.strip().lower() for n in neg_raw.split(",") if n.strip()]
@@ -116,7 +104,6 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
                 log.debug("Filter FAIL neg keyword '%s' in '%s'", neg, listing.title)
                 return False
 
-    # Price range
     if listing.price is not None:
         if search.get("price_min") and listing.price < search["price_min"]:
             return False
@@ -126,11 +113,40 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
     return True
 
 
-async def _scroll_for_listings(page: Page, scrolls: int = 3) -> None:
-    """Scroll down to load more cards — simulates human browsing."""
+async def _warm_location(page: Page, zip_code: str) -> None:
+    """
+    Navigate to the Marketplace homepage for this zip code first.
+    FB uses this visit to establish the user's location context.
+    Without it, the subsequent search URL returns 0 results because
+    FB doesn't know where to centre the radius.
+    Only runs once per session; subsequent searches skip this step.
+    """
+    global _location_warmed
+    if _location_warmed:
+        return
+
+    warmup_url = f"https://www.facebook.com/marketplace/{zip_code}"
+    log.info("Warming location context: %s", warmup_url)
+    try:
+        await page.goto(warmup_url, wait_until="domcontentloaded", timeout=60_000)
+        await asyncio.sleep(3.0)  # let FB register the location
+        _location_warmed = True
+        log.info("Location context established for zip %s.", zip_code)
+    except PWTimeoutError:
+        log.warning("Location warmup timed out — proceeding anyway.")
+
+
+async def reset_location_warm() -> None:
+    """Call this if the session is refreshed so location is re-warmed."""
+    global _location_warmed
+    _location_warmed = False
+
+
+async def _scroll_for_listings(page: Page, scrolls: int = 4) -> None:
+    """Scroll down incrementally to trigger lazy-loaded cards."""
     for i in range(scrolls):
         await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
-        await asyncio.sleep(1.5 + (i * 0.3))  # increasing jitter
+        await asyncio.sleep(1.5 + (i * 0.25))
 
 
 async def scrape_search(page: Page, search: dict) -> list[Listing]:
@@ -144,8 +160,14 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     Returns:
         List of new Listing objects (not previously seen, passes filters)
     """
-    url = _build_url(search)
     search_id = search["id"]
+    zip_code  = search.get("zip_code", "")
+
+    # Step 1: warm location context (once per session)
+    await _warm_location(page, zip_code)
+
+    # Step 2: navigate to the search results
+    url = _build_url(search)
     log.info("[Search %d] Scanning: %s", search_id, url)
 
     try:
@@ -153,14 +175,24 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     except PWTimeoutError:
         log.warning("[Search %d] Page load timed out — continuing with partial content.", search_id)
 
-    # Brief pause then scroll to trigger lazy-loaded cards
-    await asyncio.sleep(2.5)
-    await _scroll_for_listings(page, scrolls=3)
-    await asyncio.sleep(1.0)
+    # Wait for feed + scroll to load lazy cards
+    await asyncio.sleep(3.0)
+    await _scroll_for_listings(page, scrolls=4)
+    await asyncio.sleep(1.5)
+
+    # Log current URL in case FB redirected us (helps diagnose empty results)
+    current_url = page.url
+    if current_url != url:
+        log.info("[Search %d] Redirected to: %s", search_id, current_url)
 
     # Extract all listing anchor tags
-    anchors = await page.query_selector_all("a[href*='/marketplace/item/']") 
+    anchors = await page.query_selector_all("a[href*='/marketplace/item/']")
     log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
+
+    if len(anchors) == 0:
+        # Log page title to diagnose login expiry or captcha
+        title = await page.title()
+        log.warning("[Search %d] Zero listings — page title: '%s'", search_id, title)
 
     new_listings: list[Listing] = []
     seen_count = 0
@@ -172,18 +204,15 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             if not listing_id:
                 continue
 
-            # Deduplication check
             if await is_seen(listing_id, search_id):
                 seen_count += 1
                 continue
 
-            # Build full URL
             listing_url = (
                 href if href.startswith("http")
                 else f"https://www.facebook.com{href.split('?')[0]}"
             )
 
-            # Extract title — first non-empty span with dir='auto' inside the card
             title = ""
             spans = await anchor.query_selector_all("span[dir='auto']")
             for span in spans:
@@ -195,7 +224,6 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             if not title:
                 title = "(no title)"
 
-            # Extract price — look for spans containing '$'
             price: Optional[float] = None
             for span in spans:
                 text = (await span.inner_text()).strip()
@@ -203,7 +231,6 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                     price = _parse_price(text)
                     break
 
-            # Extract image
             image_url: Optional[str] = None
             img = await anchor.query_selector("img")
             if img:
@@ -218,12 +245,10 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 image_url=image_url,
             )
 
-            # Apply filter engine
             if not _passes_filter(listing, search):
-                await mark_seen(listing_id, search_id)  # mark so we don't re-check
+                await mark_seen(listing_id, search_id)
                 continue
 
-            # Persist to DB
             await upsert_listing(
                 listing_id=listing.id,
                 search_id=search_id,
