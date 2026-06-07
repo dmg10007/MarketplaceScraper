@@ -2,11 +2,10 @@
 Facebook Marketplace scraper.
 
 URL strategy:
-  FB redirects /marketplace/{zip}/search  ->  /marketplace/category/search
-  We now use the final URL directly and pass location via the
-  'location' text param that FB's own frontend uses.
-  Warmup visits /marketplace first to establish a logged-in location
-  cookie, then the search URL inherits that context.
+  Uses /marketplace/category/search with location= zip param.
+  After navigation we WAIT for the first listing card anchor to appear
+  in the DOM before querying — FB renders via React so cards arrive
+  200-2000ms after domcontentloaded.
 """
 
 import asyncio
@@ -34,22 +33,16 @@ _CONDITION_MAP = {
 }
 
 _ITEM_LINK_RE = re.compile(r"/marketplace/item/(\d+)")
+_CARD_SELECTOR = "a[href*='/marketplace/item/']"
 _location_warmed: bool = False
 
 
 def _build_url(search: dict) -> str:
-    """
-    Build the search URL using the format FB actually resolves to.
-    /marketplace/category/search is the stable post-redirect endpoint.
-    We include the zip code as the 'location' param so FB centres the
-    radius correctly even without a prior location cookie.
-    """
     params: dict = {
         "query":    search["keywords"],
         "exact":    "false",
-        "location": search.get("zip_code", ""),  # <-- key fix
+        "location": search.get("zip_code", ""),
     }
-
     if search.get("price_min") is not None:
         params["minPrice"] = int(search["price_min"])
     if search.get("price_max") is not None:
@@ -58,8 +51,7 @@ def _build_url(search: dict) -> str:
     distance_km = round(search.get("distance_mi", 40) * _MI_TO_KM)
     params["radius"] = distance_km
 
-    condition_key = search.get("condition", "any")
-    condition_val = _CONDITION_MAP.get(condition_key)
+    condition_val = _CONDITION_MAP.get(search.get("condition", "any"))
     if condition_val:
         params["itemCondition"] = condition_val
 
@@ -84,8 +76,7 @@ def _parse_price(text: str) -> Optional[float]:
 def _passes_filter(listing: Listing, search: dict) -> bool:
     title_lower = listing.title.lower()
 
-    keywords = [k.strip().lower() for k in search["keywords"].split(",") if k.strip()]
-    for kw in keywords:
+    for kw in [k.strip().lower() for k in search["keywords"].split(",") if k.strip()]:
         if not any(word in title_lower for word in kw.split()):
             log.debug("Filter FAIL keyword '%s' not in '%s'", kw, listing.title)
             return False
@@ -107,15 +98,9 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
 
 
 async def _warm_location(page: Page) -> None:
-    """
-    Visit the base Marketplace page once per session so FB sets
-    the location cookie. Uses the generic /marketplace URL (no zip)
-    since we now pass location as a URL param in every search.
-    """
     global _location_warmed
     if _location_warmed:
         return
-
     log.info("Warming Marketplace session...")
     try:
         await page.goto(
@@ -138,7 +123,27 @@ async def reset_location_warm() -> None:
 async def _scroll_for_listings(page: Page, scrolls: int = 5) -> None:
     for i in range(scrolls):
         await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
-        await asyncio.sleep(1.5 + (i * 0.2))
+        await asyncio.sleep(1.2 + (i * 0.2))
+
+
+async def _wait_for_cards(page: Page, search_id: int) -> bool:
+    """
+    Wait up to 15s for the first listing card to appear in the DOM.
+    FB renders cards via React after domcontentloaded — this is the
+    key gate that prevents querying an empty feed.
+    Returns True if cards appeared, False on timeout.
+    """
+    try:
+        await page.wait_for_selector(_CARD_SELECTOR, timeout=15_000)
+        log.info("[Search %d] Listing cards appeared in DOM.", search_id)
+        return True
+    except PWTimeoutError:
+        log.warning(
+            "[Search %d] Timed out waiting for listing cards. "
+            "Page may be showing no results, a captcha, or a login wall.",
+            search_id,
+        )
+        return False
 
 
 async def scrape_search(page: Page, search: dict) -> list[Listing]:
@@ -152,28 +157,32 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     except PWTimeoutError:
-        log.warning("[Search %d] Page load timed out — continuing with partial content.", search_id)
+        log.warning("[Search %d] Page load timed out — continuing.", search_id)
 
-    await asyncio.sleep(3.5)
-    await _scroll_for_listings(page, scrolls=5)
-    await asyncio.sleep(1.5)
+    # ── KEY FIX: wait for React to inject cards before querying ──
+    cards_found = await _wait_for_cards(page, search_id)
 
-    current_url = page.url
-    if current_url != url:
-        log.info("[Search %d] Final URL: %s", search_id, current_url)
-
-    anchors = await page.query_selector_all("a[href*='/marketplace/item/']")
-    log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
-
-    if len(anchors) == 0:
+    if not cards_found:
+        # Diagnostic dump
         title = await page.title()
         log.warning("[Search %d] Zero listings — page title: '%s'", search_id, title)
-        # Dump first 500 chars of body text to help diagnose captcha / login wall
         try:
             body_text = await page.inner_text("body")
-            log.warning("[Search %d] Page snippet: %s", search_id, body_text[:500].replace("\n", " "))
+            log.warning(
+                "[Search %d] Page snippet: %s",
+                search_id,
+                body_text[:600].replace("\n", " "),
+            )
         except Exception:
             pass
+        return []
+
+    # Scroll to load more lazy cards now that the feed is live
+    await _scroll_for_listings(page, scrolls=5)
+    await asyncio.sleep(1.0)
+
+    anchors = await page.query_selector_all(_CARD_SELECTOR)
+    log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
 
     new_listings: list[Listing] = []
     seen_count = 0
@@ -194,8 +203,9 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 else f"https://www.facebook.com{href.split('?')[0]}"
             )
 
-            title = ""
             spans = await anchor.query_selector_all("span[dir='auto']")
+
+            title = ""
             for span in spans:
                 text = (await span.inner_text()).strip()
                 if text and len(text) > 2:
