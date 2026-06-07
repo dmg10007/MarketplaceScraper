@@ -1,22 +1,12 @@
 """
 Facebook Marketplace scraper.
 
-Responsibilities:
-  - Warm location context by visiting /marketplace before each search
-  - Build search URLs from Search config
-  - Navigate to Marketplace search results via Playwright
-  - Extract listing cards (id, title, price, location, image, condition)
-  - Apply filter engine: price range, keywords, negative keywords, condition
-  - Return list[Listing] of NEW (unseen) items only
-
-FB Marketplace URL format:
-  https://www.facebook.com/marketplace/{zip}/search
-    ?query={keywords}
-    &minPrice={min}
-    &maxPrice={max}
-    &exact=false
-    &radius={miles_as_km}   <- FB uses km internally even for US searches
-    &itemCondition={new|used_like_new|used_good|used_fair|used}
+URL strategy:
+  FB redirects /marketplace/{zip}/search  ->  /marketplace/category/search
+  We now use the final URL directly and pass location via the
+  'location' text param that FB's own frontend uses.
+  Warmup visits /marketplace first to establish a logged-in location
+  cookie, then the search URL inherits that context.
 """
 
 import asyncio
@@ -44,16 +34,22 @@ _CONDITION_MAP = {
 }
 
 _ITEM_LINK_RE = re.compile(r"/marketplace/item/(\d+)")
-
-# Track whether we've warmed location this session
 _location_warmed: bool = False
 
 
 def _build_url(search: dict) -> str:
+    """
+    Build the search URL using the format FB actually resolves to.
+    /marketplace/category/search is the stable post-redirect endpoint.
+    We include the zip code as the 'location' param so FB centres the
+    radius correctly even without a prior location cookie.
+    """
     params: dict = {
-        "query": search["keywords"],
-        "exact": "false",
+        "query":    search["keywords"],
+        "exact":    "false",
+        "location": search.get("zip_code", ""),  # <-- key fix
     }
+
     if search.get("price_min") is not None:
         params["minPrice"] = int(search["price_min"])
     if search.get("price_max") is not None:
@@ -67,9 +63,7 @@ def _build_url(search: dict) -> str:
     if condition_val:
         params["itemCondition"] = condition_val
 
-    zip_code = search.get("zip_code", "")
-    base = f"https://www.facebook.com/marketplace/{zip_code}/search"
-    return f"{base}?{urlencode(params)}"
+    return f"https://www.facebook.com/marketplace/category/search?{urlencode(params)}"
 
 
 def _extract_id_from_url(href: str) -> Optional[str]:
@@ -98,8 +92,7 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
 
     neg_raw = search.get("neg_keywords", "")
     if neg_raw:
-        neg_keywords = [n.strip().lower() for n in neg_raw.split(",") if n.strip()]
-        for neg in neg_keywords:
+        for neg in [n.strip().lower() for n in neg_raw.split(",") if n.strip()]:
             if neg in title_lower:
                 log.debug("Filter FAIL neg keyword '%s' in '%s'", neg, listing.title)
                 return False
@@ -113,60 +106,46 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
     return True
 
 
-async def _warm_location(page: Page, zip_code: str) -> None:
+async def _warm_location(page: Page) -> None:
     """
-    Navigate to the Marketplace homepage for this zip code first.
-    FB uses this visit to establish the user's location context.
-    Without it, the subsequent search URL returns 0 results because
-    FB doesn't know where to centre the radius.
-    Only runs once per session; subsequent searches skip this step.
+    Visit the base Marketplace page once per session so FB sets
+    the location cookie. Uses the generic /marketplace URL (no zip)
+    since we now pass location as a URL param in every search.
     """
     global _location_warmed
     if _location_warmed:
         return
 
-    warmup_url = f"https://www.facebook.com/marketplace/{zip_code}"
-    log.info("Warming location context: %s", warmup_url)
+    log.info("Warming Marketplace session...")
     try:
-        await page.goto(warmup_url, wait_until="domcontentloaded", timeout=60_000)
-        await asyncio.sleep(3.0)  # let FB register the location
+        await page.goto(
+            "https://www.facebook.com/marketplace/",
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        await asyncio.sleep(3.0)
         _location_warmed = True
-        log.info("Location context established for zip %s.", zip_code)
+        log.info("Marketplace session warmed.")
     except PWTimeoutError:
         log.warning("Location warmup timed out — proceeding anyway.")
 
 
 async def reset_location_warm() -> None:
-    """Call this if the session is refreshed so location is re-warmed."""
     global _location_warmed
     _location_warmed = False
 
 
-async def _scroll_for_listings(page: Page, scrolls: int = 4) -> None:
-    """Scroll down incrementally to trigger lazy-loaded cards."""
+async def _scroll_for_listings(page: Page, scrolls: int = 5) -> None:
     for i in range(scrolls):
         await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
-        await asyncio.sleep(1.5 + (i * 0.25))
+        await asyncio.sleep(1.5 + (i * 0.2))
 
 
 async def scrape_search(page: Page, search: dict) -> list[Listing]:
-    """
-    Run one search and return NEW listings that pass all filters.
-
-    Args:
-        page:   Active Playwright page (from session_manager)
-        search: Row dict from searches table
-
-    Returns:
-        List of new Listing objects (not previously seen, passes filters)
-    """
     search_id = search["id"]
-    zip_code  = search.get("zip_code", "")
 
-    # Step 1: warm location context (once per session)
-    await _warm_location(page, zip_code)
+    await _warm_location(page)
 
-    # Step 2: navigate to the search results
     url = _build_url(search)
     log.info("[Search %d] Scanning: %s", search_id, url)
 
@@ -175,24 +154,26 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
     except PWTimeoutError:
         log.warning("[Search %d] Page load timed out — continuing with partial content.", search_id)
 
-    # Wait for feed + scroll to load lazy cards
-    await asyncio.sleep(3.0)
-    await _scroll_for_listings(page, scrolls=4)
+    await asyncio.sleep(3.5)
+    await _scroll_for_listings(page, scrolls=5)
     await asyncio.sleep(1.5)
 
-    # Log current URL in case FB redirected us (helps diagnose empty results)
     current_url = page.url
     if current_url != url:
-        log.info("[Search %d] Redirected to: %s", search_id, current_url)
+        log.info("[Search %d] Final URL: %s", search_id, current_url)
 
-    # Extract all listing anchor tags
     anchors = await page.query_selector_all("a[href*='/marketplace/item/']")
     log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
 
     if len(anchors) == 0:
-        # Log page title to diagnose login expiry or captcha
         title = await page.title()
         log.warning("[Search %d] Zero listings — page title: '%s'", search_id, title)
+        # Dump first 500 chars of body text to help diagnose captcha / login wall
+        try:
+            body_text = await page.inner_text("body")
+            log.warning("[Search %d] Page snippet: %s", search_id, body_text[:500].replace("\n", " "))
+        except Exception:
+            pass
 
     new_listings: list[Listing] = []
     seen_count = 0
@@ -220,7 +201,6 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 if text and len(text) > 2:
                     title = text
                     break
-
             if not title:
                 title = "(no title)"
 

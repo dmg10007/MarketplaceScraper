@@ -1,16 +1,5 @@
 """
 Telegram notifier + command handler.
-
-Alert format:
-  📦 <Title>
-  💰 $Price  |  📍 Location  |  ⭐ Condition
-  [Open listing]
-
-Commands (polling-based, runs in background task):
-  /status   — show last run time, search count, listing count
-  /pause    — pause the scheduler
-  /resume   — resume the scheduler
-  /searches — list all active searches
 """
 
 import asyncio
@@ -30,23 +19,33 @@ TG_BASE = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
 async def _tg(method: str, **kwargs) -> Optional[dict]:
     """Make a Telegram Bot API call. Returns parsed JSON or None on error."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=35) as client:
             r = await client.post(f"{TG_BASE}/{method}", json=kwargs)
             data = r.json()
             if not data.get("ok"):
-                log.warning("Telegram API error [%s]: %s", method, data.get("description"))
+                log.warning(
+                    "Telegram API error [%s] %d: %s",
+                    method,
+                    r.status_code,
+                    data.get("description", "no description"),
+                )
                 return None
             return data
+    except httpx.TimeoutException:
+        # Long-poll timeout is normal — not an error
+        if method == "getUpdates":
+            return {"ok": True, "result": []}
+        log.warning("Telegram timeout [%s]", method)
+        return None
     except Exception as exc:
-        log.error("Telegram request failed [%s]: %s", method, exc)
+        log.error("Telegram request failed [%s]: %r", method, exc)
         return None
 
 
 async def delete_webhook() -> None:
     """
     Remove any registered webhook so long-polling works.
-    Telegram does not allow getUpdates while a webhook is set.
-    Safe to call even if no webhook is registered.
+    Telegram blocks getUpdates while a webhook is active.
     """
     result = await _tg("deleteWebhook", drop_pending_updates=False)
     if result:
@@ -56,11 +55,6 @@ async def delete_webhook() -> None:
 
 
 async def send_alert(listing: Listing, search_name: str) -> bool:
-    """
-    Send a rich Telegram alert for a new listing.
-    Uses sendPhoto when image_url is available, sendMessage otherwise.
-    Returns True on success.
-    """
     price_str = listing.price_display()
     location_str = listing.location or "Location unknown"
     condition_str = listing.condition or "Not specified"
@@ -95,7 +89,6 @@ async def send_alert(listing: Listing, search_name: str) -> bool:
 
 
 async def send_message(text: str) -> bool:
-    """Send a plain message to the configured chat."""
     result = await _tg(
         "sendMessage",
         chat_id=settings.telegram_chat_id,
@@ -106,12 +99,10 @@ async def send_message(text: str) -> bool:
 
 
 async def send_health_alert(message: str) -> bool:
-    """Send a health/error alert with a warning emoji prefix."""
     return await send_message(f"⚠️ <b>MarketplaceScraper Alert</b>\n\n{message}")
 
 
 def _esc(text: str) -> str:
-    """Escape HTML special chars for Telegram HTML parse mode."""
     return (
         text.replace("&", "&amp;")
             .replace("<", "&lt;")
@@ -124,11 +115,6 @@ def _esc(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 class TelegramPoller:
-    """
-    Long-poll for Telegram updates and handle bot commands.
-    Runs as a background asyncio task alongside the scheduler.
-    """
-
     def __init__(self, scheduler) -> None:
         self._scheduler = scheduler
         self._offset: int = 0
@@ -136,7 +122,6 @@ class TelegramPoller:
         self._task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
-        # Must delete any registered webhook before polling will work
         await delete_webhook()
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
@@ -159,25 +144,23 @@ class TelegramPoller:
                 data = await _tg(
                     "getUpdates",
                     offset=self._offset,
-                    timeout=30,
+                    timeout=25,           # seconds Telegram holds the connection
                     allowed_updates=["message"],
                 )
                 if data is None:
-                    # API error — back off before retrying
                     await asyncio.sleep(min(backoff, 60))
                     backoff = min(backoff * 2, 60)
                     continue
 
-                backoff = 1  # reset on success
-                if data.get("result"):
-                    for update in data["result"]:
-                        self._offset = update["update_id"] + 1
-                        await self._handle_update(update)
+                backoff = 1
+                for update in data.get("result", []):
+                    self._offset = update["update_id"] + 1
+                    await self._handle_update(update)
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.warning("Telegram poll error: %s", exc)
+                log.warning("Telegram poll loop error: %r", exc)
                 await asyncio.sleep(min(backoff, 60))
                 backoff = min(backoff * 2, 60)
 
@@ -189,29 +172,23 @@ class TelegramPoller:
         if chat_id != str(settings.telegram_chat_id):
             return
 
-        if text == "/status":
-            await self._cmd_status()
-        elif text == "/pause":
-            await self._cmd_pause()
-        elif text == "/resume":
-            await self._cmd_resume()
-        elif text == "/searches":
-            await self._cmd_searches()
-        elif text == "/help":
-            await self._cmd_help()
+        dispatch = {
+            "/status":   self._cmd_status,
+            "/pause":    self._cmd_pause,
+            "/resume":   self._cmd_resume,
+            "/searches": self._cmd_searches,
+            "/help":     self._cmd_help,
+        }
+        handler = dispatch.get(text)
+        if handler:
+            await handler()
 
     async def _cmd_status(self) -> None:
         from db.database import get_run_log, get_all_searches
         searches = await get_all_searches(enabled_only=True)
         log_entries = await get_run_log(limit=1)
-
-        last_run = "Never"
-        if log_entries:
-            last_run = log_entries[0].get("finished_at", "Unknown")
-
-        paused = self._scheduler.paused
-        status_icon = "⏸️ Paused" if paused else "▶️ Running"
-
+        last_run = log_entries[0].get("finished_at", "Unknown") if log_entries else "Never"
+        status_icon = "⏸️ Paused" if self._scheduler.paused else "▶️ Running"
         await send_message(
             f"🤖 <b>MarketplaceScraper Status</b>\n\n"
             f"Status: {status_icon}\n"
