@@ -1,14 +1,13 @@
 """
 SQLite async database layer (aiosqlite).
 
-init_db() is safe to run on existing DBs.
-If run_log has unexpected columns (old schema), it is dropped and recreated.
+init_db() is safe to run on existing DBs — it applies all migrations.
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
-import os
 
 import aiosqlite
 
@@ -30,25 +29,25 @@ async def _add_column_if_missing(db, table, column, col_def):
         log.info("Migration: added %s.%s", table, column)
 
 
+async def _table_exists(db, name: str) -> bool:
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ) as cur:
+        return await cur.fetchone() is not None
+
+
 async def init_db() -> None:
     os.makedirs("data", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
 
         # ----------------------------------------------------------------
-        # run_log: if it exists with old schema (started_at, etc.) drop it
+        # run_log: drop+recreate if stale schema
         # ----------------------------------------------------------------
-        async with db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='run_log'"
-        ) as cur:
-            run_log_exists = await cur.fetchone() is not None
-
-        if run_log_exists:
+        if await _table_exists(db, "run_log"):
             cols = await _column_names(db, "run_log")
-            # Old schema had 'started_at'; new schema does not
             if "started_at" in cols or "search_name" not in cols:
                 log.info("run_log schema is stale — dropping and recreating.")
                 await db.execute("DROP TABLE run_log")
-                run_log_exists = False
 
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS searches (
@@ -95,7 +94,7 @@ async def init_db() -> None:
             );
         """)
 
-        # Safe column additions for other tables
+        # ---- Safe column additions (migrations) ----
         await _add_column_if_missing(db, "seen", "dismissed", "INTEGER DEFAULT 0")
         await _add_column_if_missing(db, "seen", "first_seen_at", "TEXT DEFAULT (datetime('now'))")
         await _add_column_if_missing(db, "searches", "neg_keywords", "TEXT DEFAULT ''")
@@ -104,6 +103,8 @@ async def init_db() -> None:
         await _add_column_if_missing(db, "listings", "location", "TEXT")
         await _add_column_if_missing(db, "listings", "image_url", "TEXT")
         await _add_column_if_missing(db, "listings", "condition", "TEXT")
+        # Critical: created_at was added late — existing DBs may be missing it
+        await _add_column_if_missing(db, "listings", "created_at", "TEXT DEFAULT (datetime('now'))")
 
         await db.commit()
         log.info("Database ready at %s", DB_PATH)
@@ -208,15 +209,19 @@ async def upsert_listing(
 
 
 async def get_listings(search_id: Optional[int] = None, limit: int = 50) -> list[dict]:
+    """
+    Fetch listings. Falls back to rowid ordering if created_at is missing/null
+    so old DBs never crash.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        order = "ORDER BY rowid DESC"
         if search_id:
-            async with db.execute(
-                "SELECT * FROM listings WHERE search_id=? ORDER BY created_at DESC LIMIT ?",
-                (search_id, limit),
-            ) as cur:
+            sql = f"SELECT * FROM listings WHERE search_id=? {order} LIMIT ?"
+            async with db.execute(sql, (search_id, limit)) as cur:
                 return [dict(r) for r in await cur.fetchall()]
-        async with db.execute("SELECT * FROM listings ORDER BY created_at DESC LIMIT ?", (limit,)) as cur:
+        sql = f"SELECT * FROM listings {order} LIMIT ?"
+        async with db.execute(sql, (limit,)) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
