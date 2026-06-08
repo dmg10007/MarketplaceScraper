@@ -51,10 +51,6 @@ async def _table_exists(db, name: str) -> bool:
 async def init_db() -> None:
     os.makedirs("data", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
-
-        # ----------------------------------------------------------------
-        # run_log: drop+recreate if stale schema
-        # ----------------------------------------------------------------
         if await _table_exists(db, "run_log"):
             cols = await _column_names(db, "run_log")
             if "started_at" in cols or "search_name" not in cols:
@@ -106,11 +102,7 @@ async def init_db() -> None:
             );
         """)
 
-        # ---- Safe column additions (migrations) ----
-        # Note: ALTER TABLE columns must use literal/NULL defaults, not expressions.
-        # Backfill with UPDATE after adding.
         await _add_column_if_missing(db, "seen", "dismissed", "INTEGER DEFAULT 0")
-        # first_seen_at: add as TEXT NULL, backfill existing rows to current time
         added = await _add_column_if_missing(db, "seen", "first_seen_at", "TEXT")
         if added:
             now = datetime.now(tz=timezone.utc).isoformat()
@@ -123,7 +115,6 @@ async def init_db() -> None:
         await _add_column_if_missing(db, "listings", "image_url", "TEXT")
         await _add_column_if_missing(db, "listings", "condition", "TEXT")
 
-        # created_at: add as plain TEXT (no expression default), backfill existing rows
         added = await _add_column_if_missing(db, "listings", "created_at", "TEXT")
         if added:
             now = datetime.now(tz=timezone.utc).isoformat()
@@ -179,9 +170,13 @@ async def delete_search(search_id: int) -> None:
 
 
 async def is_seen(listing_id: str, search_id: int) -> bool:
+    """
+    A listing counts as seen if it exists in the seen table at all, including
+    dismissed rows. This prevents 'not interested' items from being re-alerted.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT 1 FROM seen WHERE listing_id=? AND search_id=? AND dismissed=0",
+            "SELECT 1 FROM seen WHERE listing_id=? AND search_id=?",
             (listing_id, search_id),
         ) as cur:
             return await cur.fetchone() is not None
