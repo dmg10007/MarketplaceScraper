@@ -51,6 +51,8 @@ async def _table_exists(db, name: str) -> bool:
 async def init_db() -> None:
     os.makedirs("data", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
+
+        # run_log: drop+recreate if stale schema
         if await _table_exists(db, "run_log"):
             cols = await _column_names(db, "run_log")
             if "started_at" in cols or "search_name" not in cols:
@@ -102,6 +104,7 @@ async def init_db() -> None:
             );
         """)
 
+        # Safe column additions (migrations)
         await _add_column_if_missing(db, "seen", "dismissed", "INTEGER DEFAULT 0")
         added = await _add_column_if_missing(db, "seen", "first_seen_at", "TEXT")
         if added:
@@ -171,8 +174,9 @@ async def delete_search(search_id: int) -> None:
 
 async def is_seen(listing_id: str, search_id: int) -> bool:
     """
-    A listing counts as seen if it exists in the seen table at all, including
-    dismissed rows. This prevents 'not interested' items from being re-alerted.
+    Returns True if this listing has ever been seen OR dismissed for this search.
+    Dismissed listings must NEVER re-alert — the dismissed flag is not a reason
+    to treat the listing as unseen.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -199,13 +203,22 @@ async def reset_seen_for_search(search_id: int) -> int:
 
 
 async def dismiss_listing(listing_id: str) -> None:
+    """
+    Mark a listing as dismissed across ALL searches so it never re-alerts.
+    Sets dismissed=1 on any existing seen row and inserts a dismissed row
+    for every search that doesn't have one yet.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE seen SET dismissed=1 WHERE listing_id=?", (listing_id,))
+        # Update any existing seen rows
+        await db.execute(
+            "UPDATE seen SET dismissed=1 WHERE listing_id=?", (listing_id,)
+        )
+        # Insert dismissed rows for searches that haven't seen it yet
         async with db.execute("SELECT id FROM searches") as cur:
             rows = await cur.fetchall()
         for (sid,) in rows:
             await db.execute(
-                "INSERT OR IGNORE INTO seen (listing_id,search_id,dismissed) VALUES (?,?,1)",
+                "INSERT OR IGNORE INTO seen (listing_id, search_id, dismissed) VALUES (?,?,1)",
                 (listing_id, sid),
             )
         await db.commit()
@@ -230,13 +243,24 @@ async def upsert_listing(
 
 
 async def get_listings(search_id: Optional[int] = None, limit: int = 50) -> list[dict]:
+    """Only returns listings that have NOT been dismissed."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if search_id:
-            sql = "SELECT * FROM listings WHERE search_id=? ORDER BY rowid DESC LIMIT ?"
+            sql = (
+                "SELECT l.* FROM listings l "
+                "LEFT JOIN seen s ON s.listing_id=l.id AND s.search_id=l.search_id "
+                "WHERE l.search_id=? AND (s.dismissed IS NULL OR s.dismissed=0) "
+                "ORDER BY l.rowid DESC LIMIT ?"
+            )
             async with db.execute(sql, (search_id, limit)) as cur:
                 return [dict(r) for r in await cur.fetchall()]
-        sql = "SELECT * FROM listings ORDER BY rowid DESC LIMIT ?"
+        sql = (
+            "SELECT l.* FROM listings l "
+            "LEFT JOIN seen s ON s.listing_id=l.id AND s.search_id=l.search_id "
+            "WHERE (s.dismissed IS NULL OR s.dismissed=0) "
+            "ORDER BY l.rowid DESC LIMIT ?"
+        )
         async with db.execute(sql, (limit,)) as cur:
             return [dict(r) for r in await cur.fetchall()]
 

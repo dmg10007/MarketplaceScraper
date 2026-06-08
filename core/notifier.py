@@ -79,7 +79,7 @@ def _relative_time(iso_str: str) -> str:
         h = (total % 86400) // 3600
         return f"{d}d {h}h ago"
     except Exception:
-        return iso_str  # fallback to raw string if parse fails
+        return iso_str
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +91,7 @@ class Notifier:
     Injected into Scheduler via scheduler.wire().
 
     send_alert(search, listing)
-      search  — dict from DB row (has keys: id, name, ...)
+      search  — dict from DB row (keys: id, name, ...)
       listing — dict with keys: id, title, listing_url, price, location,
                   image_url, condition
     """
@@ -131,7 +131,6 @@ class Notifier:
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
-        # Fallback to sendMessage if no image or sendPhoto failed
         if result is None:
             result = await _tg(
                 "sendMessage",
@@ -158,7 +157,6 @@ class Notifier:
         return result is not None
 
     async def send_raw(self, text: str) -> bool:
-        """Alias for send_message — used by scheduler health alerts."""
         return await self.send_message(text)
 
     async def send_health_alert(self, message: str) -> bool:
@@ -196,7 +194,7 @@ class TelegramPoller:
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
         log.info("Telegram command poller started.")
-        await _notifier.send_message("\U0001f916 Telegram poller ready. Send /help to your bot to test.")
+        await _notifier.send_message("\U0001f916 MarketplaceScraper online. Send /help for commands.")
 
     async def stop(self) -> None:
         self._running = False
@@ -271,9 +269,7 @@ class TelegramPoller:
             last_run_str = _relative_time(raw_ts) if raw_ts else "Unknown"
             last_status = last_entry.get("status", "unknown")
             last_found = last_entry.get("new_listings", 0)
-            last_run_detail = (
-                f"{last_run_str}  \u2014  {last_status}  \u2014  {last_found} new"
-            )
+            last_run_detail = f"{last_run_str}  —  {last_status}  —  {last_found} new"
         else:
             last_run_detail = "Never"
 
@@ -295,7 +291,7 @@ class TelegramPoller:
         await _notifier.send_message("\u25b6\ufe0f Scheduler resumed.")
 
     async def _cmd_scan(self) -> None:
-        await _notifier.send_message("\U0001f50d Manual scan triggered…")
+        await _notifier.send_message("\U0001f50d Manual scan triggered\u2026")
         asyncio.create_task(self._scheduler.run_all_searches())
 
     async def _cmd_searches(self) -> None:
@@ -307,9 +303,10 @@ class TelegramPoller:
         lines = ["<b>Configured Searches</b>\n"]
         for s in searches:
             icon = "\u2705" if s["enabled"] else "\u274c"
+            neg = f"\n   Exclude: <i>{_esc(s['neg_keywords'])}</i>" if s.get('neg_keywords') else ""
             lines.append(
                 f"{icon} [<code>{s['id']}</code>] <b>{_esc(s['name'])}</b>\n"
-                f"   Keywords: {_esc(s['keywords'])}\n"
+                f"   Keywords: {_esc(s['keywords'])}{neg}\n"
                 f"   Price: ${s['price_min'] or 0}\u2013${s['price_max'] or '\u221e'}  "
                 f"Radius: {s['distance_mi']}mi\n"
                 f"   /delete {s['id']} to remove"
@@ -350,28 +347,44 @@ class TelegramPoller:
             await _notifier.send_message(f"\u274c Delete failed: {_esc(str(exc))}")
 
     async def _cmd_addsearch(self, text: str) -> None:
+        """
+        Usage: /addsearch name | keywords | zip | max_price | neg_keywords
+
+        Pipe-delimited. neg_keywords is optional (5th field).
+        Example:
+          /addsearch OLED TV | oled tv | 27330 | 500 | exercise,broken,parts
+        """
         from db.database import create_search
         try:
             _, args = text.split(None, 1)
             parts = [p.strip() for p in args.split("|")]
             if len(parts) < 3:
-                raise ValueError
-            name, keywords, zip_code = parts[0], parts[1], parts[2]
-            price_max = float(parts[3]) if len(parts) > 3 else None
+                raise ValueError("need at least 3 fields")
+            name        = parts[0]
+            keywords    = parts[1]
+            zip_code    = parts[2]
+            price_max   = float(parts[3]) if len(parts) > 3 and parts[3] else None
+            neg_keywords = parts[4] if len(parts) > 4 and parts[4] else ""
+
             search_id = await create_search(
                 name=name, keywords=keywords,
                 zip_code=zip_code, price_max=price_max,
+                neg_keywords=neg_keywords,
             )
+            neg_line = f"\nExclude: <i>{_esc(neg_keywords)}</i>" if neg_keywords else ""
             await _notifier.send_message(
                 f"\u2705 Search created! ID: <code>{search_id}</code>\n"
-                f"Name: <b>{_esc(name)}</b>  Keywords: {_esc(keywords)}\n"
+                f"Name: <b>{_esc(name)}</b>\n"
+                f"Keywords: {_esc(keywords)}{neg_line}\n"
                 f"Zip: {zip_code}  Max: ${price_max or '\u221e'}\n"
                 f"Next scan will include this search."
             )
         except (ValueError, IndexError):
             await _notifier.send_message(
-                "\u2139\ufe0f <b>Usage:</b> /addsearch name | keywords | zip | max_price\n\n"
-                "<b>Example:</b>\n/addsearch Road Bike | bike | 27330 | 400"
+                "\u2139\ufe0f <b>Usage:</b> /addsearch name | keywords | zip | max_price | neg_keywords\n\n"
+                "<b>Example:</b>\n"
+                "/addsearch OLED TV | oled tv | 27330 | 500 | exercise,broken,parts\n\n"
+                "<i>neg_keywords is optional \u2014 comma-separated words to exclude.</i>"
             )
 
     async def _cmd_help(self) -> None:
@@ -381,7 +394,7 @@ class TelegramPoller:
             "/searches \u2014 list searches with IDs\n"
             "/scan \u2014 trigger an immediate scan\n"
             "/delete &lt;id&gt; \u2014 delete a search (asks confirmation)\n"
-            "/addsearch name | keywords | zip | max \u2014 add a search\n"
+            "/addsearch name | keywords | zip | max | neg \u2014 add a search\n"
             "/pause \u2014 pause scanning\n"
             "/resume \u2014 resume scanning\n"
             "/help \u2014 this message"

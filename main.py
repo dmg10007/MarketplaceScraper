@@ -164,7 +164,8 @@ async def list_listings(search_id: Optional[int] = None, limit: int = 50):
 async def dismiss_listing_route(listing_id: str):
     from db.database import dismiss_listing
     await dismiss_listing(listing_id)
-    return {"dismissed": listing_id}
+    # Return an empty string so HTMX outerHTML swap removes the card cleanly
+    return HTMLResponse("")
 
 
 @app.get("/runlog")
@@ -209,7 +210,7 @@ def _listing_card(l: dict) -> str:
         <button class="btn-dismiss"
           hx-post="/listings/{lid}/dismiss"
           hx-target="#card-{lid}"
-          hx-swap="outerHTML swap:0.4s">
+          hx-swap="outerHTML swap:0.3s">
           &#10005; Not interested
         </button>
       </div>
@@ -258,20 +259,26 @@ async def partial_searches():
         )
         pmin = f"${s['price_min']:.0f}" if s.get('price_min') else '$0'
         pmax = f"${s['price_max']:.0f}" if s.get('price_max') else '&infin;'
+        neg = s.get('neg_keywords') or ''
+        neg_cell = f'<code style="font-size:.72rem;color:var(--red)">{neg}</code>' if neg else '<span style="color:var(--muted)">—</span>'
         rows += f"""
         <tr id="search-row-{s['id']}">
           <td style="color:var(--muted)">{s['id']}</td>
           <td><b>{s['name']}</b></td>
           <td><code style="font-size:.78rem">{s['keywords']}</code></td>
+          <td>{neg_cell}</td>
           <td>{pmin}&ndash;{pmax}</td>
           <td>{s['distance_mi']} mi</td>
           <td>{badge}</td>
           <td>
             <button class="btn-dismiss"
               hx-delete="/searches/{s['id']}"
-              hx-confirm="Delete search '{s['name']}'?"
-              hx-target="#search-row-{s['id']}"
-              hx-swap="outerHTML swap:0.3s"
+              hx-confirm="Delete search '{s['name']}' and all its listings?"
+              hx-target="#searches-tbody"
+              hx-swap="innerHTML"
+              hx-get="/partials/searches"
+              hx-trigger="click"
+              onclick="event.preventDefault(); if(confirm(\"Delete search '{s['name']}' and all its listings?\")) {{ htmx.ajax('DELETE','/searches/{s[\"id\"]}',{{target:'#search-row-{s[\"id\"]}',swap:'outerHTML'}}).then(()=>htmx.ajax('GET','/partials/searches',{{target:'#searches-tbody',swap:'innerHTML'}})); }}"
             >Delete</button>
           </td>
         </tr>"""
@@ -459,7 +466,7 @@ async def dashboard():
       border-color: var(--red); color: var(--red);
       background: rgba(239,68,68,.08);
     }}
-    .htmx-swapping {{ opacity: 0 !important; transform: scale(.95); transition: all .4s ease; }}
+    .htmx-swapping {{ opacity: 0 !important; transform: scale(.95); transition: all .3s ease; }}
 
     /* ---- Table ---- */
     table {{ width: 100%; border-collapse: collapse; }}
@@ -531,8 +538,8 @@ async def dashboard():
     <button class="btn btn-primary" id="scan-btn"
       hx-post="/scan/trigger"
       hx-swap="none"
-      hx-on::before-request="this.disabled=true; this.textContent='Scanning…'; document.getElementById('scan-indicator').classList.add('visible')"
-      hx-on::after-request="setTimeout(()=>{{this.disabled=false; this.textContent='&#9654; Scan Now'; document.getElementById('scan-indicator').classList.remove('visible'); htmx.trigger('#listings-grid','refresh');}}, 8000)">
+      hx-on::before-request="this.disabled=true; this.textContent='Scanning\u2026'; document.getElementById('scan-indicator').classList.add('visible')"
+      hx-on::after-request="setTimeout(()=>{{this.disabled=false; this.textContent='\u25b6 Scan Now'; document.getElementById('scan-indicator').classList.remove('visible'); htmx.trigger('#listings-grid','refresh');}}, 8000)">
       &#9654; Scan Now
     </button>
   </div>
@@ -564,7 +571,7 @@ async def dashboard():
           <input name="price_min" placeholder="Min $" type="number">
           <input name="price_max" placeholder="Max $" type="number">
           <input name="distance_mi" placeholder="Radius mi" type="number" value="40">
-          <input class="full" name="neg_keywords" placeholder="Exclude keywords">
+          <input class="full" name="neg_keywords" placeholder="Exclude keywords (comma separated)">
           <select class="full" name="condition">
             <option value="any">Any condition</option>
             <option value="new">New</option>
@@ -611,7 +618,7 @@ async def dashboard():
     <div class="tab-panel" id="tab-searches">
       <table>
         <thead><tr>
-          <th>ID</th><th>Name</th><th>Keywords</th>
+          <th>ID</th><th>Name</th><th>Keywords</th><th>Exclude</th>
           <th>Price</th><th>Radius</th><th>Status</th><th></th>
         </tr></thead>
         <tbody id="searches-tbody"
@@ -633,6 +640,12 @@ function switchTab(btn, panelId) {{
   if (panelId === 'tab-searches') {{
     htmx.ajax('GET', '/partials/searches', {{target:'#searches-tbody', swap:'innerHTML'}});
   }}
+}}
+
+function deleteSearch(id, name) {{
+  if (!confirm('Delete search \"' + name + '\" and all its listings?')) return;
+  fetch('/searches/' + id, {{method: 'DELETE'}})
+    .then(() => htmx.ajax('GET', '/partials/searches', {{target: '#searches-tbody', swap: 'innerHTML'}}));
 }}
 </script>
 </body>
