@@ -6,6 +6,9 @@ Tables:
   seen         — dedup: (listing_id, search_id) pairs
   listings     — scraped listing records
   run_log      — scan history for health monitoring + dashboard
+
+init_db() is safe to run on existing DBs — uses ALTER TABLE IF NOT EXISTS
+pattern to add missing columns without destroying existing data.
 """
 
 import logging
@@ -21,8 +24,20 @@ log = logging.getLogger(__name__)
 DB_PATH = settings.db_path
 
 
+async def _add_column_if_missing(db: aiosqlite.Connection, table: str, column: str, col_def: str) -> None:
+    """Safely add a column to a table if it doesn't already exist."""
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        cols = [row[1] for row in await cur.fetchall()]
+    if column not in cols:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+        log.info("Migrated: added column '%s' to table '%s'", column, table)
+
+
 async def init_db() -> None:
+    import os
+    os.makedirs("data", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
+        # Create tables
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS searches (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,14 +76,25 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS run_log (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 search_id    INTEGER,
-                search_name  TEXT,
                 status       TEXT,
                 new_listings INTEGER DEFAULT 0,
                 finished_at  TEXT    DEFAULT (datetime('now'))
             );
         """)
+
+        # Safe migrations — add missing columns to existing tables
+        await _add_column_if_missing(db, "run_log", "search_name", "TEXT")
+        await _add_column_if_missing(db, "seen", "dismissed", "INTEGER DEFAULT 0")
+        await _add_column_if_missing(db, "seen", "first_seen_at", "TEXT DEFAULT (datetime('now'))")
+        await _add_column_if_missing(db, "searches", "neg_keywords", "TEXT DEFAULT ''")
+        await _add_column_if_missing(db, "searches", "zip_code", "TEXT NOT NULL DEFAULT ''")
+        await _add_column_if_missing(db, "searches", "condition", "TEXT DEFAULT 'any'")
+        await _add_column_if_missing(db, "listings", "location", "TEXT")
+        await _add_column_if_missing(db, "listings", "image_url", "TEXT")
+        await _add_column_if_missing(db, "listings", "condition", "TEXT")
+
         await db.commit()
-        log.info("Database initialised at %s", DB_PATH)
+        log.info("Database ready at %s", DB_PATH)
 
 
 async def get_all_searches(enabled_only: bool = False) -> list[dict]:
@@ -141,14 +167,20 @@ async def mark_seen(listing_id: str, search_id: int) -> None:
         await db.commit()
 
 
+async def reset_seen_for_search(search_id: int) -> int:
+    """Clear all seen entries for a search so all listings fire as new on next run."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM seen WHERE search_id = ?", (search_id,))
+        await db.commit()
+        return cur.rowcount
+
+
 async def dismiss_listing(listing_id: str) -> None:
-    """Mark as dismissed so it never appears again across all searches."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE seen SET dismissed = 1 WHERE listing_id = ?",
             (listing_id,),
         )
-        # Also insert into any searches that haven't seen it yet
         async with db.execute("SELECT id FROM searches") as cur:
             rows = await cur.fetchall()
         for (sid,) in rows:
