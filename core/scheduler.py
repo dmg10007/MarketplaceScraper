@@ -1,155 +1,197 @@
 """
-Scheduler — runs periodic scans and health watchdog.
+Scheduler — runs searches on a fixed interval.
 
-Phase 5:
-  - Health alert if no successful run in >1 hour
-  - Session expiry detection via marketplace.reset_location_warm()
-  - mark_seen only after alert succeeds (no lost listings)
+Phase 5 additions:
+  - Health alert: Telegram message if no successful run in >1 hour
+  - SessionExpiredError handling with auto-re-login attempt
 """
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from config.settings import settings
+from core.marketplace import search_marketplace, SessionExpiredError
+from db.database import (
+    get_all_searches,
+    is_seen, mark_seen, upsert_listing,
+    log_run, get_last_successful_run,
+)
 
 log = logging.getLogger(__name__)
 
+_HEALTH_CHECK_INTERVAL = 3600   # seconds between health checks
+_MAX_STALE_SECONDS = 3600        # alert if no success run in this window
+
 
 class Scheduler:
-    def __init__(self) -> None:
+    def __init__(self, interval_minutes: int = 15):
+        self.interval = interval_minutes * 60
+        self.paused = False
+        self._task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
         self._session_manager = None
         self._notifier = None
-        self.paused: bool = False
-        self._scan_task: Optional[asyncio.Task] = None
-        self._watchdog_task: Optional[asyncio.Task] = None
-        self._running: bool = False
 
-    def wire(self, session_manager, notifier) -> None:
+    def wire(self, session_manager, notifier):
         self._session_manager = session_manager
         self._notifier = notifier
 
-    def pause(self) -> None:
-        self.paused = True
-        log.info("Scheduler paused.")
-
-    def resume(self) -> None:
-        self.paused = False
-        log.info("Scheduler resumed.")
-
-    async def start(self) -> None:
-        self._running = True
-        self._scan_task = asyncio.create_task(self._scan_loop())
-        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+    async def start(self):
+        self._task = asyncio.create_task(self._scan_loop())
+        self._health_task = asyncio.create_task(self._health_loop())
         log.info("Scheduler started (interval=%dm).", settings.scan_interval_minutes)
 
-    async def stop(self) -> None:
-        self._running = False
-        for task in (self._scan_task, self._watchdog_task):
-            if task:
-                task.cancel()
+    async def stop(self):
+        for t in (self._task, self._health_task):
+            if t:
+                t.cancel()
                 try:
-                    await task
+                    await t
                 except asyncio.CancelledError:
                     pass
         log.info("Scheduler stopped.")
 
-    async def _scan_loop(self) -> None:
-        await asyncio.sleep(5)
-        while self._running:
-            if not self.paused:
-                try:
-                    await self.run_all_searches()
-                except Exception as exc:
-                    log.error("Scan loop unhandled error: %r", exc)
-            await asyncio.sleep(settings.scan_interval_minutes * 60)
+    # ----------------------------------------------------------------
+    # Main scan loop
+    # ----------------------------------------------------------------
 
-    async def _watchdog_loop(self) -> None:
-        CHECK_INTERVAL = 600
-        ALERT_THRESHOLD = 3600
-        await asyncio.sleep(CHECK_INTERVAL)
-        while self._running:
+    async def _scan_loop(self):
+        while True:
             try:
-                from db.database import get_last_successful_run
-                last = await get_last_successful_run()
-                if last and last.get("finished_at"):
-                    finished = datetime.fromisoformat(last["finished_at"])
-                    if finished.tzinfo is None:
-                        finished = finished.replace(tzinfo=timezone.utc)
-                    gap = (datetime.now(tz=timezone.utc) - finished).total_seconds()
-                    if gap > ALERT_THRESHOLD and self._notifier:
-                        mins = int(gap / 60)
-                        await self._notifier.send_health_alert(
-                            f"No successful scan in {mins} minutes.\n"
-                            f"Last run: {last['finished_at']}\n\n"
-                            f"Check logs or send /scan to retry."
-                        )
+                await self.run_all_searches()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                log.warning("Watchdog check error: %r", exc)
-            await asyncio.sleep(CHECK_INTERVAL)
+                log.error("Scan loop unhandled error: %s", exc)
+            await asyncio.sleep(self.interval)
 
-    async def run_all_searches(self) -> None:
-        from db.database import get_all_searches, log_run, mark_seen
-        from core.marketplace import scrape_search
-
-        if self._session_manager is None or self._notifier is None:
-            log.error("Scheduler not wired — call scheduler.wire() before starting.")
+    async def run_all_searches(self):
+        if self.paused:
+            log.info("[Scheduler] Paused — skipping scan.")
+            return
+        if not self._session_manager or not self._notifier:
+            log.warning("[Scheduler] Not wired — skipping scan.")
             return
 
         searches = await get_all_searches(enabled_only=True)
         if not searches:
-            log.warning("[Scheduler] No enabled searches found in DB — add one via /addsearch or the dashboard.")
+            log.info("[Scheduler] No enabled searches.")
             return
 
         log.info("[Scheduler] Starting scan for %d search(es).", len(searches))
+        page = await self._session_manager.new_page()
 
-        page = await self._session_manager.get_page()
-        if page is None:
-            log.error("[Scheduler] No browser page available — skipping scan.")
-            return
-
-        for search in searches:
-            if self.paused:
-                break
-            log.info("[Scheduler] ► Running search [%d] '%s'", search["id"], search["name"])
-            new_count = 0
-            status = "success"
-            try:
-                listings = await scrape_search(page, search)
-                log.info("[Scheduler] Search [%d] returned %d new listing(s).", search["id"], len(listings))
-
-                if not listings:
-                    log.info("[Scheduler] No new listings for '%s' — all already seen or none found.", search["name"])
-
-                for listing in listings:
-                    log.info(
-                        "[Scheduler] Sending alert: '%s' $%s  %s",
-                        listing.title,
-                        listing.price,
-                        listing.listing_url,
+        try:
+            for s in searches:
+                log.info("[Scheduler] ► Running search [%d] '%s'", s["id"], s["name"])
+                neg_kws = [
+                    k.strip().lower()
+                    for k in (s.get("neg_keywords") or "").split(",")
+                    if k.strip()
+                ]
+                try:
+                    new_listings = await search_marketplace(
+                        page=page,
+                        search_id=s["id"],
+                        search_name=s["name"],
+                        keywords=s["keywords"],
+                        zip_code=s["zip_code"] or settings.default_zip,
+                        price_min=s.get("price_min"),
+                        price_max=s.get("price_max"),
+                        distance_mi=s.get("distance_mi") or 40,
+                        neg_keywords=neg_kws,
+                        condition=s.get("condition") or "any",
+                        is_seen_fn=is_seen,
+                        mark_seen_fn=mark_seen,
+                        upsert_listing_fn=upsert_listing,
                     )
-                    sent = await self._notifier.send_alert(listing, search["name"])
-                    if sent:
-                        await mark_seen(listing.id, search["id"])
-                        new_count += 1
-                        log.info("[Scheduler] ✅ Alert sent + marked seen: %s", listing.id)
+
+                    for listing in new_listings:
+                        await self._notifier.send_alert(s, listing)
+                        await mark_seen(listing["id"], s["id"])
+                        log.info("[Scheduler] ✅ Alert sent + marked seen: %s", listing["id"])
+
+                    await log_run(
+                        search_id=s["id"],
+                        search_name=s["name"],
+                        status="success",
+                        new_listings=len(new_listings),
+                    )
+                    log.info(
+                        "[Scheduler] Search [%d] returned %d new listing(s).",
+                        s["id"], len(new_listings),
+                    )
+                    if not new_listings:
+                        log.info(
+                            "[Scheduler] No new listings for '%s' — all already seen or none found.",
+                            s["name"],
+                        )
+
+                except SessionExpiredError:
+                    log.warning("[Scheduler] Session expired during search '%s'. Attempting re-login...", s["name"])
+                    await log_run(s["id"], s["name"], "session_expired", 0)
+                    relogged = await self._session_manager.attempt_relogin()
+                    if relogged:
+                        log.info("[Scheduler] Re-login successful.")
                     else:
-                        log.warning("[Scheduler] ❌ Alert FAILED for %s — NOT marking seen.", listing.id)
+                        log.error("[Scheduler] Re-login failed. Manual intervention required.")
+                        await self._notifier.send_raw(
+                            "\u26a0\ufe0f *MarketplaceScraper* — Facebook session expired and re-login failed. "
+                            "Run `python scripts/setup_session.py` to restore the session."
+                        )
+                    break  # stop remaining searches this cycle
 
+                except Exception as exc:
+                    log.error("[Scheduler] Error in search '%s': %s", s["name"], exc)
+                    await log_run(s["id"], s["name"], f"error: {exc}", 0)
+
+        finally:
+            await page.close()
+
+    # ----------------------------------------------------------------
+    # Health check loop
+    # ----------------------------------------------------------------
+
+    async def _health_loop(self):
+        """Every hour, check that a successful run happened in the last hour."""
+        await asyncio.sleep(3600)  # give the bot a full hour before first check
+        while True:
+            try:
+                await self._check_health()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                log.exception("[Scheduler] Search [%d] crashed: %r", search["id"], exc)
-                status = "error"
+                log.error("Health check error: %s", exc)
+            await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
 
-            await log_run(
-                search_id=search["id"],
-                search_name=search["name"],
-                status=status,
-                new_listings=new_count,
-            )
-            log.info("[Scheduler] ■ Done search [%d] — status=%s new=%d", search["id"], status, new_count)
+    async def _check_health(self):
+        last = await get_last_successful_run()
+        if not last:
+            await self._send_health_alert("No successful scan has ever completed.")
+            return
+        try:
+            finished = datetime.fromisoformat(last["finished_at"].replace("Z", "+00:00"))
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=timezone.utc)
+            age = datetime.now(tz=timezone.utc) - finished
+            if age > timedelta(seconds=_MAX_STALE_SECONDS):
+                mins = int(age.total_seconds() / 60)
+                await self._send_health_alert(
+                    f"Last successful scan was {mins} minutes ago. Bot may be stuck."
+                )
+        except Exception as exc:
+            log.warning("Health check datetime parse error: %s", exc)
 
-        log.info("[Scheduler] All searches complete.")
+    async def _send_health_alert(self, reason: str):
+        if self._notifier:
+            msg = f"\u26a0\ufe0f *MarketplaceScraper Health Alert*\n{reason}"
+            try:
+                await self._notifier.send_raw(msg)
+                log.warning("Health alert sent: %s", reason)
+            except Exception as exc:
+                log.error("Failed to send health alert: %s", exc)
 
 
-scheduler = Scheduler()
+scheduler = Scheduler(interval_minutes=settings.scan_interval_minutes)
