@@ -1,5 +1,9 @@
 """
-Facebook Marketplace scraper — mobile site strategy.
+Facebook Marketplace scraper.
+
+Strategy:
+  1. Try desktop FB (www.facebook.com/marketplace/search) first.
+  2. If zero results, fall back to mobile FB (m.facebook.com).
 
 Phase 5 hardening:
   - Random jitter (2-8s) between navigations
@@ -14,7 +18,7 @@ import random
 import re
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 
 from playwright.async_api import Page, TimeoutError as PWTimeoutError
 
@@ -37,7 +41,32 @@ _SCREENSHOT_PATH = Path("data/debug_screenshot.png")
 _location_warmed: bool = False
 
 
-def _build_url(search: dict) -> str:
+def _build_desktop_url(search: dict) -> str:
+    """Desktop FB Marketplace search URL."""
+    zip_code = search.get("zip_code", "")
+    keywords = search["keywords"]
+    radius = int(search.get("distance_mi", 40))
+
+    params: dict = {}
+    if search.get("price_min") is not None:
+        params["minPrice"] = int(search["price_min"])
+    if search.get("price_max") is not None:
+        params["maxPrice"] = int(search["price_max"])
+    params["deliveryMethod"] = "local"
+    condition_val = _CONDITION_MAP.get(search.get("condition", "any"))
+    if condition_val:
+        params["itemCondition"] = condition_val
+
+    qs = urlencode(params)
+    location_segment = zip_code if zip_code else "109550"
+    return (
+        f"https://www.facebook.com/marketplace/{location_segment}/search"
+        f"?query={quote_plus(keywords)}&radius={radius}&{qs}"
+    ).rstrip("&")
+
+
+def _build_mobile_url(search: dict) -> str:
+    """Mobile FB Marketplace search URL (fallback)."""
     params: dict = {"query": search["keywords"]}
     if search.get("price_min") is not None:
         params["minPrice"] = int(search["price_min"])
@@ -69,14 +98,18 @@ def _parse_price(text: str) -> Optional[float]:
 
 def _passes_filter(listing: Listing, search: dict) -> bool:
     title_lower = listing.title.lower()
+    # Keyword check: every comma-separated keyword must appear somewhere in title
     for kw in [k.strip().lower() for k in search["keywords"].split(",") if k.strip()]:
         if not any(word in title_lower for word in kw.split()):
             return False
+    # Negative keyword check
     neg_raw = search.get("neg_keywords", "")
     if neg_raw:
         for neg in [n.strip().lower() for n in neg_raw.split(",") if n.strip()]:
             if neg in title_lower:
+                log.debug("Filtered out '%s' — matched neg keyword '%s'", listing.title, neg)
                 return False
+    # Price check
     if listing.price is not None:
         if search.get("price_min") and listing.price < search["price_min"]:
             return False
@@ -86,13 +119,11 @@ def _passes_filter(listing: Listing, search: dict) -> bool:
 
 
 async def _jitter(short: bool = False) -> None:
-    """Phase 5: random delay to mimic human browsing pace."""
     lo, hi = (0.5, 2.0) if short else (2.0, 8.0)
     await asyncio.sleep(random.uniform(lo, hi))
 
 
 async def _human_scroll(page: Page) -> None:
-    """Phase 5: scroll down in steps to trigger lazy-loaded content."""
     try:
         for _ in range(random.randint(3, 6)):
             dist = random.randint(300, 700)
@@ -104,7 +135,6 @@ async def _human_scroll(page: Page) -> None:
 
 
 async def _session_still_valid(page: Page) -> bool:
-    """Phase 5: detect FB logout / checkpoint via page title."""
     try:
         title = (await page.title()).lower()
         return not any(b in title for b in ("log in", "log into", "checkpoint"))
@@ -112,78 +142,53 @@ async def _session_still_valid(page: Page) -> bool:
         return True
 
 
-async def _warm_location(page: Page) -> None:
-    global _location_warmed
-    if _location_warmed:
-        return
-    log.info("Warming mobile Marketplace session...")
-    try:
-        await page.goto(
-            "https://m.facebook.com/marketplace/",
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
-        await _jitter()
-        _location_warmed = True
-        log.info("Mobile Marketplace session warmed.")
-    except PWTimeoutError:
-        log.warning("Warmup timed out — proceeding anyway.")
-        _location_warmed = True
-
-
-async def reset_location_warm() -> None:
-    global _location_warmed
-    _location_warmed = False
-
-
-async def _save_debug_screenshot(page: Page, search_id: int) -> None:
+async def _save_debug_screenshot(page: Page, label: str) -> None:
     try:
         _SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        await page.screenshot(path=str(_SCREENSHOT_PATH), full_page=True)
-        log.warning("[Search %d] Screenshot -> %s", search_id, _SCREENSHOT_PATH)
+        path = Path(f"data/debug_{label}.png")
+        await page.screenshot(path=str(path), full_page=True)
+        log.warning("Screenshot saved → %s  (open this to see what FB showed)", path)
     except Exception as exc:
-        log.warning("[Search %d] Screenshot failed: %s", search_id, exc)
+        log.warning("Screenshot failed: %s", exc)
 
 
-async def scrape_search(page: Page, search: dict) -> list[Listing]:
-    """
-    Scrape and return NEW listings that passed filtering.
-    mark_seen() is NOT called for new listings here — scheduler calls it
-    after a successful alert. Filtered-out listings are marked seen immediately.
-    """
-    search_id = search["id"]
-    await _warm_location(page)
-
-    if not await _session_still_valid(page):
-        log.warning("[Search %d] Session appears expired — skipping scan.", search_id)
-        return []
-
-    url = _build_url(search)
-    log.info("[Search %d] Scanning (mobile): %s", search_id, url)
-
+async def _try_load_page(page: Page, url: str, search_id: int) -> bool:
+    """Navigate and return True if the page loaded without hard timeout."""
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        return True
     except PWTimeoutError:
-        log.warning("[Search %d] Page load timed out — continuing.", search_id)
+        log.warning("[Search %d] Page load timed out: %s", search_id, url)
+        return False
 
-    await _human_scroll(page)
 
+async def _extract_listings(page: Page, search: dict) -> list[Listing]:
+    """
+    Parse anchor tags from the current page.
+    Returns only NEW listings that pass the filter.
+    Already-seen listings are silently skipped.
+    Filtered-out (neg kw / price) listings are marked seen immediately.
+    """
+    search_id = search["id"]
     anchors = await page.query_selector_all("a[href*='/marketplace/item/']")
-    log.info("[Search %d] Found %d raw listing links.", search_id, len(anchors))
+    log.info("[Search %d] Found %d raw item links on page.", search_id, len(anchors))
 
     if len(anchors) == 0:
         title = await page.title()
-        log.warning("[Search %d] Zero listings — page title: '%s'", search_id, title)
+        log.warning(
+            "[Search %d] Zero item links — page title: '%s'",
+            search_id, title,
+        )
         try:
-            body_text = await page.inner_text("body")
-            log.warning("[Search %d] Snippet: %s", search_id, body_text[:500].replace("\n", " "))
+            snippet = await page.inner_text("body")
+            log.warning("[Search %d] Body snippet: %s", search_id, snippet[:600].replace("\n", " "))
         except Exception:
             pass
-        await _save_debug_screenshot(page, search_id)
         return []
 
     new_listings: list[Listing] = []
     seen_count = 0
+    filtered_count = 0
 
     for anchor in anchors:
         try:
@@ -202,16 +207,15 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             )
 
             anchor_text = await anchor.inner_text()
-            title = anchor_text.strip().split("\n")[0]
-            if not title or len(title) < 2:
-                title = "(no title)"
+            lines = [l.strip() for l in anchor_text.strip().splitlines() if l.strip()]
+            title = lines[0] if lines else "(no title)"
 
             price: Optional[float] = None
-            price_match = re.search(r"\$(\d[\d,]*(?:\.\d+)?)", anchor_text)
-            if price_match:
-                price = _parse_price(price_match.group(0))
-            elif "free" in anchor_text.lower():
-                price = 0.0
+            for line in lines:
+                p = _parse_price(line)
+                if p is not None:
+                    price = p
+                    break
 
             image_url: Optional[str] = None
             img = await anchor.query_selector("img")
@@ -227,7 +231,13 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 image_url=image_url,
             )
 
+            log.debug(
+                "[Search %d] Candidate: id=%s title='%s' price=%s",
+                search_id, listing_id, title, price,
+            )
+
             if not _passes_filter(listing, search):
+                filtered_count += 1
                 await mark_seen(listing_id, search_id)
                 continue
 
@@ -241,7 +251,6 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
                 image_url=listing.image_url,
                 condition=listing.condition,
             )
-            # DO NOT mark_seen here — scheduler does it after alert succeeds
             new_listings.append(listing)
             await _jitter(short=True)
 
@@ -249,5 +258,54 @@ async def scrape_search(page: Page, search: dict) -> list[Listing]:
             log.warning("[Search %d] Error parsing card: %s", search_id, exc)
             continue
 
-    log.info("[Search %d] Done — %d new, %d already seen.", search_id, len(new_listings), seen_count)
+    log.info(
+        "[Search %d] Results — new=%d  already_seen=%d  filtered_out=%d",
+        search_id, len(new_listings), seen_count, filtered_count,
+    )
     return new_listings
+
+
+async def reset_location_warm() -> None:
+    global _location_warmed
+    _location_warmed = False
+
+
+async def scrape_search(page: Page, search: dict) -> list[Listing]:
+    search_id = search["id"]
+
+    if not await _session_still_valid(page):
+        log.warning("[Search %d] Session appears expired — skipping scan.", search_id)
+        return []
+
+    # --- Strategy 1: Desktop FB ---
+    desktop_url = _build_desktop_url(search)
+    log.info("[Search %d] Trying desktop URL: %s", search_id, desktop_url)
+    loaded = await _try_load_page(page, desktop_url, search_id)
+    if loaded:
+        await _human_scroll(page)
+        listings = await _extract_listings(page, search)
+        if listings:
+            return listings
+        # If 0 results from desktop, check if it's a session/load issue
+        title = await page.title()
+        log.info("[Search %d] Desktop returned 0 new listings (title='%s'). Trying mobile...", search_id, title)
+        await _save_debug_screenshot(page, f"{search_id}_desktop")
+
+    # --- Strategy 2: Mobile FB fallback ---
+    mobile_url = _build_mobile_url(search)
+    log.info("[Search %d] Trying mobile fallback URL: %s", search_id, mobile_url)
+    loaded = await _try_load_page(page, mobile_url, search_id)
+    if loaded:
+        await _jitter()
+        await _human_scroll(page)
+        listings = await _extract_listings(page, search)
+        if listings:
+            return listings
+        await _save_debug_screenshot(page, f"{search_id}_mobile")
+
+    log.warning(
+        "[Search %d] Both desktop and mobile returned 0 new listings. "
+        "Check data/debug_%d_desktop.png and data/debug_%d_mobile.png",
+        search_id, search_id, search_id,
+    )
+    return []
