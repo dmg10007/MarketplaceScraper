@@ -207,18 +207,25 @@ async def dismiss_listing(listing_id: str) -> None:
     Mark a listing as dismissed across ALL searches so it never re-alerts.
     Sets dismissed=1 on any existing seen row and inserts a dismissed row
     for every search that doesn't have one yet.
+
+    Uses INSERT OR REPLACE (not INSERT OR IGNORE) so that if a seen row
+    already exists with dismissed=0 for a search that was added after the
+    UPDATE ran, it is forcibly overwritten to dismissed=1 rather than
+    silently skipped.
     """
     async with aiosqlite.connect(DB_PATH) as db:
-        # Update any existing seen rows
+        # Update any existing seen rows for this listing
         await db.execute(
             "UPDATE seen SET dismissed=1 WHERE listing_id=?", (listing_id,)
         )
-        # Insert dismissed rows for searches that haven't seen it yet
+        # Guarantee a dismissed=1 row exists for every current search.
+        # INSERT OR REPLACE overwrites any row that slipped through the UPDATE
+        # (e.g. inserted between the UPDATE and now with dismissed=0).
         async with db.execute("SELECT id FROM searches") as cur:
             rows = await cur.fetchall()
         for (sid,) in rows:
             await db.execute(
-                "INSERT OR IGNORE INTO seen (listing_id, search_id, dismissed) VALUES (?,?,1)",
+                "INSERT OR REPLACE INTO seen (listing_id, search_id, dismissed) VALUES (?,?,1)",
                 (listing_id, sid),
             )
         await db.commit()

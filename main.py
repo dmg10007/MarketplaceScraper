@@ -261,6 +261,7 @@ async def partial_searches():
         pmax = f"${s['price_max']:.0f}" if s.get('price_max') else '&infin;'
         neg = s.get('neg_keywords') or ''
         neg_cell = f'<code style="font-size:.72rem;color:var(--red)">{neg}</code>' if neg else '<span style="color:var(--muted)">—</span>'
+        # Use only onclick=deleteSearch() — no HTMX attrs to avoid double-fire
         rows += f"""
         <tr id="search-row-{s['id']}">
           <td style="color:var(--muted)">{s['id']}</td>
@@ -272,13 +273,7 @@ async def partial_searches():
           <td>{badge}</td>
           <td>
             <button class="btn-dismiss"
-              hx-delete="/searches/{s['id']}"
-              hx-confirm="Delete search '{s['name']}' and all its listings?"
-              hx-target="#searches-tbody"
-              hx-swap="innerHTML"
-              hx-get="/partials/searches"
-              hx-trigger="click"
-              onclick="event.preventDefault(); if(confirm(\"Delete search '{s['name']}' and all its listings?\")) {{ htmx.ajax('DELETE','/searches/{s[\"id\"]}',{{target:'#search-row-{s[\"id\"]}',swap:'outerHTML'}}).then(()=>htmx.ajax('GET','/partials/searches',{{target:'#searches-tbody',swap:'innerHTML'}})); }}"
+              onclick="deleteSearch({s['id']}, '{s['name'].replace(chr(39), chr(92)+chr(39))}')"
             >Delete</button>
           </td>
         </tr>"""
@@ -643,7 +638,7 @@ function switchTab(btn, panelId) {{
 }}
 
 function deleteSearch(id, name) {{
-  if (!confirm('Delete search \"' + name + '\" and all its listings?')) return;
+  if (!confirm('Delete search "' + name + '" and all its listings?')) return;
   fetch('/searches/' + id, {{method: 'DELETE'}})
     .then(() => htmx.ajax('GET', '/partials/searches', {{target: '#searches-tbody', swap: 'innerHTML'}}));
 }}
