@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     session_file: str = Field(default="data/fb_session.json",
                               description="Path to persisted browser cookies/storage")
 
+    # --- Database ---
+    db_path: str = Field(default="data/marketplace.db",
+                         description="Path to the SQLite database file")
+
     # --- Proxy (optional — leave blank to use raw IP) ---
     proxy_url: Optional[str] = Field(default=None,
                                      description="e.g. http://user:pass@host:port — leave blank to skip")
