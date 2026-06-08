@@ -2,6 +2,10 @@
 SQLite async database layer (aiosqlite).
 
 init_db() is safe to run on existing DBs — it applies all migrations.
+
+SQLite ALTER TABLE limitation: columns added via ALTER TABLE cannot use
+expression defaults like DEFAULT (datetime('now')). Add as plain TEXT
+then UPDATE to backfill existing rows.
 """
 
 import logging
@@ -23,10 +27,18 @@ async def _column_names(db: aiosqlite.Connection, table: str) -> list[str]:
 
 
 async def _add_column_if_missing(db, table, column, col_def):
+    """
+    Add a column only if it doesn't exist yet.
+    col_def must NOT use expression defaults (e.g. datetime('now')) —
+    SQLite forbids those in ALTER TABLE. Use plain literals or NULL instead,
+    then backfill separately.
+    """
     cols = await _column_names(db, table)
     if column not in cols:
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
         log.info("Migration: added %s.%s", table, column)
+        return True
+    return False
 
 
 async def _table_exists(db, name: str) -> bool:
@@ -95,19 +107,33 @@ async def init_db() -> None:
         """)
 
         # ---- Safe column additions (migrations) ----
+        # Note: ALTER TABLE columns must use literal/NULL defaults, not expressions.
+        # Backfill with UPDATE after adding.
         await _add_column_if_missing(db, "seen", "dismissed", "INTEGER DEFAULT 0")
-        await _add_column_if_missing(db, "seen", "first_seen_at", "TEXT DEFAULT (datetime('now'))")
+        # first_seen_at: add as TEXT NULL, backfill existing rows to current time
+        added = await _add_column_if_missing(db, "seen", "first_seen_at", "TEXT")
+        if added:
+            now = datetime.now(tz=timezone.utc).isoformat()
+            await db.execute("UPDATE seen SET first_seen_at=? WHERE first_seen_at IS NULL", (now,))
+
         await _add_column_if_missing(db, "searches", "neg_keywords", "TEXT DEFAULT ''")
         await _add_column_if_missing(db, "searches", "zip_code", "TEXT NOT NULL DEFAULT ''")
         await _add_column_if_missing(db, "searches", "condition", "TEXT DEFAULT 'any'")
         await _add_column_if_missing(db, "listings", "location", "TEXT")
         await _add_column_if_missing(db, "listings", "image_url", "TEXT")
         await _add_column_if_missing(db, "listings", "condition", "TEXT")
-        # Critical: created_at was added late — existing DBs may be missing it
-        await _add_column_if_missing(db, "listings", "created_at", "TEXT DEFAULT (datetime('now'))")
+
+        # created_at: add as plain TEXT (no expression default), backfill existing rows
+        added = await _add_column_if_missing(db, "listings", "created_at", "TEXT")
+        if added:
+            now = datetime.now(tz=timezone.utc).isoformat()
+            await db.execute(
+                "UPDATE listings SET created_at=? WHERE created_at IS NULL", (now,)
+            )
+            log.info("Migration: backfilled listings.created_at for existing rows.")
 
         await db.commit()
-        log.info("Database ready at %s", DB_PATH)
+        log.info("Database initialised.")
 
 
 async def get_all_searches(enabled_only: bool = False) -> list[dict]:
@@ -209,18 +235,13 @@ async def upsert_listing(
 
 
 async def get_listings(search_id: Optional[int] = None, limit: int = 50) -> list[dict]:
-    """
-    Fetch listings. Falls back to rowid ordering if created_at is missing/null
-    so old DBs never crash.
-    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        order = "ORDER BY rowid DESC"
         if search_id:
-            sql = f"SELECT * FROM listings WHERE search_id=? {order} LIMIT ?"
+            sql = "SELECT * FROM listings WHERE search_id=? ORDER BY rowid DESC LIMIT ?"
             async with db.execute(sql, (search_id, limit)) as cur:
                 return [dict(r) for r in await cur.fetchall()]
-        sql = f"SELECT * FROM listings {order} LIMIT ?"
+        sql = "SELECT * FROM listings ORDER BY rowid DESC LIMIT ?"
         async with db.execute(sql, (limit,)) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
